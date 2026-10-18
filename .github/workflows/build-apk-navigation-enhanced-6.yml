@@ -1,0 +1,577 @@
+name: Build QM NAVIGASI Enhanced APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK
+        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Extract Android project
+        run: unzip -q QM-NAVIGASI-Android-CloudBuild-DIAGNOSTIC.zip -d buildsrc
+
+      - name: Fix AppCompat theme crash
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          ANDROID = "{http://schemas.android.com/apk/res/android}"
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          ET.register_namespace("tools", "http://schemas.android.com/tools")
+          manifest_path = Path("app/src/main/AndroidManifest.xml")
+          manifest_tree = ET.parse(manifest_path)
+          manifest_root = manifest_tree.getroot()
+          application = manifest_root.find("application")
+          if application is None:
+              raise SystemExit("AndroidManifest.xml has no application element")
+          main_activity = next((node for node in application.iter("activity")
+                                if node.get(ANDROID + "name", "").endswith("MainActivity")), None)
+          activity_theme = main_activity.get(ANDROID + "theme") if main_activity is not None else None
+          effective_theme = activity_theme or application.get(ANDROID + "theme")
+          style_name = effective_theme[len("@style/"):] if effective_theme and effective_theme.startswith("@style/") else None
+          resource_files = sorted(Path("app/src/main/res").glob("values*/*.xml"))
+          changed = False
+          if style_name:
+              for resource_file in resource_files:
+                  try:
+                      resource_tree = ET.parse(resource_file)
+                  except ET.ParseError:
+                      continue
+                  for style in resource_tree.getroot().findall("style"):
+                      if style.get("name") == style_name:
+                          style.set("parent", "Theme.AppCompat.Light.NoActionBar")
+                          resource_tree.write(resource_file, encoding="utf-8", xml_declaration=True)
+                          changed = True
+          if not changed:
+              values_dir = Path("app/src/main/res/values")
+              values_dir.mkdir(parents=True, exist_ok=True)
+              styles_path = values_dir / "styles.xml"
+              if styles_path.exists():
+                  styles_tree = ET.parse(styles_path)
+                  styles_root = styles_tree.getroot()
+              else:
+                  styles_root = ET.Element("resources")
+                  styles_tree = ET.ElementTree(styles_root)
+              appcompat_style = next((node for node in styles_root.findall("style")
+                                      if node.get("name") == "QMAppCompatTheme"), None)
+              if appcompat_style is None:
+                  appcompat_style = ET.SubElement(styles_root, "style", {"name": "QMAppCompatTheme"})
+              appcompat_style.set("parent", "Theme.AppCompat.Light.NoActionBar")
+              styles_tree.write(styles_path, encoding="utf-8", xml_declaration=True)
+              if main_activity is not None:
+                  main_activity.set(ANDROID + "theme", "@style/QMAppCompatTheme")
+              else:
+                  application.set(ANDROID + "theme", "@style/QMAppCompatTheme")
+              manifest_tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
+          PY
+
+      - name: Fix Kotlin single-line property
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: sed -i 's/singleLine = true/isSingleLine = true/' app/src/main/java/com/nav3dmalaysia/MainActivity.kt
+
+      - name: Apply navigation improvements
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+
+          source_path = Path("app/src/main/java/com/nav3dmalaysia/MainActivity.kt")
+          source = source_path.read_text(encoding="utf-8")
+
+          def replace_once(old, new, label):
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f"Patch stopped: expected one match for {label}, found {count}")
+              source = source.replace(old, new, 1)
+
+          replace_once(
+              "import android.widget.Button\nimport android.widget.EditText\n",
+              "import android.widget.ArrayAdapter\nimport android.widget.Button\nimport android.widget.EditText\nimport android.widget.Spinner\n",
+              "widget imports",
+          )
+          replace_once(
+              '        private const val ROUTE_LAYER = "nav-route-layer"\n        private const val CAMERA_SOURCE = "nav-camera-source"\n',
+              '        private const val ROUTE_LAYER = "nav-route-layer"\n        private const val ROUTE_CASING_LAYER = "nav-route-casing-layer"\n        private const val TURN_SOURCE = "nav-turn-source"\n        private const val TURN_LAYER = "nav-turn-layer"\n        private const val CAMERA_SOURCE = "nav-camera-source"\n',
+              "map layer constants",
+          )
+          replace_once(
+              "    private lateinit var nextTurnText: TextView\n    private lateinit var instructionsText: TextView\n    private lateinit var cameraButton: Button\n",
+              "    private lateinit var nextTurnText: TextView\n    private lateinit var metricsText: TextView\n    private lateinit var routeLegendText: TextView\n    private lateinit var instructionsText: TextView\n    private lateinit var cameraButton: Button\n    private lateinit var startNavigationButton: Button\n    private lateinit var voiceLanguageSpinner: Spinner\n",
+              "UI fields",
+          )
+          replace_once(
+              "    private var currentStepIndex = 0\n    private var cameraPoints: List<SpeedCamera> = emptyList()\n",
+              '    private var currentStepIndex = 0\n    private var navigationStarted = false\n    private var voiceLanguage = "kelantan"\n    private var cameraPoints: List<SpeedCamera> = emptyList()\n',
+              "navigation state",
+          )
+          replace_once(
+              "                            .zoom(16.5)\n                            .bearing(bearing)\n",
+              "                            .zoom(nextCameraZoom(location))\n                            .bearing(bearing)\n",
+              "automatic turn zoom",
+          )
+          replace_once(
+              """        listOf(gpsButton, threeDButton, cameraButton).forEachIndexed { index, button ->
+                      val params = LinearLayout.LayoutParams(0, dp(42), if (index == 2) 1.35f else 1f)
+                      if (index > 0) params.marginStart = dp(5)
+                      controls.addView(button, params)
+                  }
+                  root.addView(controls, LinearLayout.LayoutParams(-1, -2))
+          """,
+              """        startNavigationButton = makeButton("MULA")
+                  startNavigationButton.isEnabled = false
+                  startNavigationButton.setOnClickListener { startNavigation() }
+                  listOf(gpsButton, threeDButton, cameraButton, startNavigationButton).forEachIndexed { index, button ->
+                      val weight = if (index == 2) 1.2f else 1f
+                      val params = LinearLayout.LayoutParams(0, dp(42), weight)
+                      if (index > 0) params.marginStart = dp(4)
+                      controls.addView(button, params)
+                  }
+                  root.addView(controls, LinearLayout.LayoutParams(-1, -2))
+
+                  val voiceRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(12), 0, dp(12), dp(5))
+                  }
+                  val voiceLabel = TextView(this).apply {
+                      text = "SUARA:"
+                      textSize = 12f
+                      setTextColor(Color.rgb(51, 65, 85))
+                  }
+                  voiceRow.addView(voiceLabel, LinearLayout.LayoutParams(-2, dp(40)))
+                  voiceLanguageSpinner = Spinner(this)
+                  val voiceAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, listOf("Melayu Kelantan", "English"))
+                  voiceAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+                  voiceLanguageSpinner.adapter = voiceAdapter
+                  voiceLanguageSpinner.setSelection(0)
+                  voiceLanguageSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                      override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                          voiceLanguage = if (position == 1) "english" else "kelantan"
+                          applyTtsLanguage()
+                      }
+                      override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+                  }
+                  val voiceSpinnerParams = LinearLayout.LayoutParams(0, dp(40), 1f)
+                  voiceSpinnerParams.marginStart = dp(8)
+                  voiceRow.addView(voiceLanguageSpinner, voiceSpinnerParams)
+                  root.addView(voiceRow, LinearLayout.LayoutParams(-1, -2))
+          """,
+              "start and voice controls",
+          )
+          replace_once(
+              "        nextTurnText = TextView(this).apply {\n",
+              """        metricsText = TextView(this).apply {
+                      text = "Kelajuan: -- km/j  •  Ke destinasi: --  •  Baki: --"
+                      textSize = 12f
+                      setTextColor(Color.rgb(30, 41, 59))
+                      setPadding(0, dp(4), 0, dp(3))
+                  }
+                  routeLegendText = TextView(this).apply {
+                      text = "PETUNJUK: Biru terang = laluan dipilih  •  Jalan lain = kelabu  •  Simpang seterusnya = jingga"
+                      textSize = 10f
+                      setTextColor(Color.rgb(100, 116, 139))
+                      setPadding(0, dp(2), 0, dp(3))
+                  }
+                  nextTurnText = TextView(this).apply {
+          """,
+              "metrics and route legend",
+          )
+          replace_once(
+              "        bottomPanel.addView(statusText, LinearLayout.LayoutParams(-1, -2))\n        bottomPanel.addView(nextTurnText, LinearLayout.LayoutParams(-1, -2))\n",
+              "        bottomPanel.addView(statusText, LinearLayout.LayoutParams(-1, -2))\n        bottomPanel.addView(metricsText, LinearLayout.LayoutParams(-1, -2))\n        bottomPanel.addView(nextTurnText, LinearLayout.LayoutParams(-1, -2))\n        bottomPanel.addView(routeLegendText, LinearLayout.LayoutParams(-1, -2))\n",
+              "bottom panel rows",
+          )
+          replace_once(
+              '            style.addSource(GeoJsonSource(ROUTE_SOURCE, EMPTY_FEATURE_COLLECTION))\n            style.addSource(GeoJsonSource(CAMERA_SOURCE, EMPTY_FEATURE_COLLECTION))\n',
+              '            style.addSource(GeoJsonSource(ROUTE_SOURCE, EMPTY_FEATURE_COLLECTION))\n            style.addSource(GeoJsonSource(TURN_SOURCE, EMPTY_FEATURE_COLLECTION))\n            style.addSource(GeoJsonSource(CAMERA_SOURCE, EMPTY_FEATURE_COLLECTION))\n',
+              "turn marker source",
+          )
+          replace_once(
+              """            style.addLayer(
+                          LineLayer(ROUTE_LAYER, ROUTE_SOURCE).withProperties(
+                              lineColor("#2563EB"),
+                              lineWidth(6f),
+                              lineCap(Property.LINE_CAP_ROUND),
+                              lineJoin(Property.LINE_JOIN_ROUND)
+                          )
+                      )
+                      style.addLayer(
+                          CircleLayer(CAMERA_LAYER, CAMERA_SOURCE).withProperties(
+          """,
+              """            // White casing makes the selected route visible over junctions and flyovers.
+                      style.addLayer(
+                          LineLayer(ROUTE_CASING_LAYER, ROUTE_SOURCE).withProperties(
+                              lineColor("#FFFFFF"),
+                              lineWidth(10f),
+                              lineCap(Property.LINE_CAP_ROUND),
+                              lineJoin(Property.LINE_JOIN_ROUND)
+                          )
+                      )
+                      style.addLayer(
+                          LineLayer(ROUTE_LAYER, ROUTE_SOURCE).withProperties(
+                              lineColor("#005BFF"),
+                              lineWidth(6f),
+                              lineCap(Property.LINE_CAP_ROUND),
+                              lineJoin(Property.LINE_JOIN_ROUND)
+                          )
+                      )
+                      style.addLayer(
+                          CircleLayer(TURN_LAYER, TURN_SOURCE).withProperties(
+                              circleRadius(9f),
+                              circleColor("#F97316"),
+                              circleStrokeColor("#FFFFFF"),
+                              circleStrokeWidth(3f)
+                          )
+                      )
+                      style.addLayer(
+                          CircleLayer(CAMERA_LAYER, CAMERA_SOURCE).withProperties(
+          """,
+              "route casing and turn marker layers",
+          )
+          replace_once(
+              """                    currentRoute = route
+                              currentStepIndex = route.steps.indexOfFirst { it.type != "depart" }.let { if (it >= 0) it else 0 }
+                              warnedCameraIds.clear()
+                              followGps = true
+                              currentStyle?.getSourceAs<GeoJsonSource>(ROUTE_SOURCE)?.setGeoJson(route.geoJson)
+          """,
+              """                    currentRoute = route
+                              currentStepIndex = route.steps.indexOfFirst { it.type != "depart" }.let { if (it >= 0) it else 0 }
+                              navigationStarted = false
+                              startNavigationButton.text = "MULA"
+                              startNavigationButton.isEnabled = true
+                              warnedCameraIds.clear()
+                              followGps = true
+                              currentStyle?.getSourceAs<GeoJsonSource>(ROUTE_SOURCE)?.setGeoJson(route.geoJson)
+                              updateTurnMarker()
+          """,
+              "route ready and start button",
+          )
+          replace_once(
+              '                    loadSpeedCameras(route.coordinates, route.distanceMeters)\n',
+              '                    updateMetrics(currentLocation)\n                    loadSpeedCameras(route.coordinates, route.distanceMeters)\n',
+              "initial metrics",
+          )
+          replace_once(
+              '                    tts?.speak("Laluan ditemui. Jarak ${formatDistance(route.distanceMeters)}. ${route.steps.getOrNull(currentStepIndex)?.instruction ?: "Ikut garisan biru."}", TextToSpeech.QUEUE_FLUSH, null, "route_start")\n',
+              '                    speakNavigation("Laluan ditemui. Jarak ${formatDistance(route.distanceMeters)}. Tekan Mula untuk memulakan panduan.", TextToSpeech.QUEUE_FLUSH, "route_ready")\n',
+              "route-ready speech",
+          )
+
+          maneuver_pattern = r"    private fun describeManeuver\(type: String, modifier: String, road: String\): String \{.*?\n    \}\n"
+          maneuver_replacement = """    private fun describeManeuver(type: String, modifier: String, road: String): String {
+                  val side = modifier.lowercase(Locale.ROOT)
+                  val action = when (type.lowercase(Locale.ROOT)) {
+                      "depart" -> "Mulakan perjalanan"
+                      "arrive" -> "Anda tiba di destinasi"
+                      "turn", "end of road" -> when (side) {
+                          "left" -> "Belok kiri"
+                          "right" -> "Belok kanan"
+                          "slight left" -> "Belok sedikit ke kiri"
+                          "slight right" -> "Belok sedikit ke kanan"
+                          "sharp left" -> "Belok tajam ke kiri"
+                          "sharp right" -> "Belok tajam ke kanan"
+                          "uturn", "u-turn" -> "Buat pusingan U"
+                          else -> "Belok mengikut laluan biru"
+                      }
+                      "on ramp" -> when (side) {
+                          "left", "slight left", "sharp left" -> "Ambil susur masuk kiri; ikut laluan biru untuk naik ke flyover jika ditunjukkan"
+                          "right", "slight right", "sharp right" -> "Ambil susur masuk kanan; ikut laluan biru untuk naik ke flyover jika ditunjukkan"
+                          else -> "Masuk ke jalan susur yang diserlahkan biru"
+                      }
+                      "off ramp" -> when (side) {
+                          "left", "slight left", "sharp left" -> "Keluar melalui susur kiri yang diserlahkan biru"
+                          "right", "slight right", "sharp right" -> "Keluar melalui susur kanan yang diserlahkan biru"
+                          else -> "Keluar melalui jalan susur yang diserlahkan biru"
+                      }
+                      "fork" -> when (side) {
+                          "left", "slight left", "sharp left" -> "Di percabangan, ikut jalan kiri yang berwarna biru"
+                          "right", "slight right", "sharp right" -> "Di percabangan, ikut jalan kanan yang berwarna biru"
+                          else -> "Di percabangan, ikut jalan yang berwarna biru"
+                      }
+                      "merge" -> when (side) {
+                          "left", "slight left" -> "Masuk ke laluan utama dari kiri"
+                          "right", "slight right" -> "Masuk ke laluan utama dari kanan"
+                          else -> "Cantum ke laluan utama yang berwarna biru"
+                      }
+                      "roundabout", "rotary" -> "Masuk bulatan dan ikut laluan biru"
+                      "roundabout turn" -> "Ikut bulatan mengikut laluan biru"
+                      "exit roundabout" -> when (side) {
+                          "left", "slight left" -> "Keluar bulatan ke kiri"
+                          "right", "slight right" -> "Keluar bulatan ke kanan"
+                          else -> "Keluar bulatan mengikut laluan biru"
+                      }
+                      "continue", "new name" -> "Teruskan mengikut laluan biru"
+                      else -> "Ikut laluan biru dan jangan ambil jalan kelabu"
+                  }
+                  return if (road.isNotBlank() && type.lowercase(Locale.ROOT) !in setOf("depart", "arrive")) "$action ke $road" else action
+              }
+          """
+          match = re.search(maneuver_pattern, source, re.S)
+          if not match:
+              raise SystemExit("Patch stopped: could not locate describeManeuver")
+          source = source[:match.start()] + maneuver_replacement + source[match.end():]
+
+          progress_pattern = r"    private fun updateNavigationProgress\(location: Location\) \{.*?\n    \}\n\n    private fun checkNearbySpeedCameras"
+          progress_replacement = """    private fun startNavigation() {
+                  val route = currentRoute
+                  if (route == null) {
+                      statusText.text = "Cari destinasi dahulu, kemudian tekan MULA."
+                      return
+                  }
+                  navigationStarted = true
+                  followGps = true
+                  startNavigationButton.text = "AKTIF"
+                  startNavigationButton.isEnabled = false
+                  currentLocation?.let {
+                      updateNavigationProgress(it)
+                      focusOnLocation(it, nextCameraZoom(it))
+                  }
+                  val instruction = route.steps.getOrNull(currentStepIndex)?.instruction ?: "Ikut laluan biru"
+                  speakNavigation("Navigasi bermula. $instruction", TextToSpeech.QUEUE_FLUSH, "navigation_start")
+              }
+
+              private fun nextCameraZoom(location: Location): Double {
+                  val step = currentRoute?.steps?.getOrNull(currentStepIndex) ?: return 16.5
+                  val distance = distanceMeters(location.latitude, location.longitude, step.latitude, step.longitude)
+                  return if (navigationStarted && distance <= 100.0) 18.5 else 16.5
+              }
+
+              private fun updateTurnMarker() {
+                  val step = currentRoute?.steps?.getOrNull(currentStepIndex)
+                  val json = if (step == null) {
+                      EMPTY_FEATURE_COLLECTION
+                  } else {
+                      JSONObject()
+                          .put("type", "FeatureCollection")
+                          .put("features", JSONArray().put(JSONObject()
+                              .put("type", "Feature")
+                              .put("geometry", JSONObject().put("type", "Point")
+                                  .put("coordinates", JSONArray().put(step.longitude).put(step.latitude)))
+                              .put("properties", JSONObject())))
+                          .toString()
+                  }
+                  currentStyle?.getSourceAs<GeoJsonSource>(TURN_SOURCE)?.setGeoJson(json)
+              }
+
+              private fun updateMetrics(location: Location?) {
+                  val speedKmh = if (location != null && location.hasSpeed()) (location.speed * 3.6f).roundToInt() else 0
+                  val route = currentRoute
+                  if (route == null) {
+                      metricsText.text = "Kelajuan: $speedKmh km/j  •  Ke destinasi: --  •  Baki: --"
+                      return
+                  }
+                  val step = route.steps.getOrNull(currentStepIndex)
+                  val toTurn = if (location != null && step != null) {
+                      distanceMeters(location.latitude, location.longitude, step.latitude, step.longitude)
+                  } else 0.0
+                  val remainingDistance = if (step == null) 0.0 else
+                      (toTurn + route.steps.drop(currentStepIndex + 1).sumOf { it.distanceMeters }).coerceAtMost(route.distanceMeters)
+                  val remainingSeconds = if (route.distanceMeters > 0.0) route.durationSeconds * (remainingDistance / route.distanceMeters) else 0.0
+                  metricsText.text = "Kelajuan: $speedKmh km/j  •  Ke destinasi: ${formatDistance(remainingDistance)}  •  Baki: ${formatDuration(remainingSeconds)}"
+              }
+
+              private fun applyTtsLanguage() {
+                  val engine = tts ?: return
+                  val preferred = if (voiceLanguage == "english") Locale.US else Locale("ms", "MY")
+                  val result = engine.setLanguage(preferred)
+                  if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                      engine.setLanguage(if (voiceLanguage == "english") Locale.ENGLISH else Locale("ms"))
+                  }
+              }
+
+              private fun speakNavigation(message: String, queueMode: Int, utteranceId: String) {
+                  val spoken = if (voiceLanguage == "english") localizeEnglish(message) else localizeKelantan(message)
+                  tts?.speak(spoken, queueMode, null, utteranceId)
+              }
+
+              private fun localizeEnglish(message: String): String {
+                  var result = message
+                  val replacements = listOf(
+                      "Ambil susur masuk kiri; ikut laluan biru untuk naik ke flyover jika ditunjukkan" to "Take the left ramp onto the flyover if shown by the blue route",
+                      "Ambil susur masuk kanan; ikut laluan biru untuk naik ke flyover jika ditunjukkan" to "Take the right ramp onto the flyover if shown by the blue route",
+                      "Keluar melalui jalan susur yang diserlahkan biru" to "Take the blue exit ramp",
+                      "Masuk ke jalan susur yang diserlahkan biru" to "Take the blue entrance ramp",
+                      "Di percabangan, ikut jalan kiri" to "At the fork, take the left road",
+                      "Di percabangan, ikut jalan kanan" to "At the fork, take the right road",
+                      "Belok sedikit ke kiri" to "Bear slightly left",
+                      "Belok sedikit ke kanan" to "Bear slightly right",
+                      "Belok tajam ke kiri" to "Turn sharply left",
+                      "Belok tajam ke kanan" to "Turn sharply right",
+                      "Anda tiba di destinasi" to "You have arrived at your destination",
+                      "Mulakan perjalanan" to "Start your journey",
+                      "Laluan ditemui" to "Route found",
+                      "Navigasi bermula" to "Navigation started",
+                      "Belok kiri" to "Turn left",
+                      "Belok kanan" to "Turn right",
+                      "Buat pusingan U" to "Make a U-turn",
+                      "Teruskan mengikut laluan biru" to "Continue along the blue route",
+                      "Ikut laluan biru" to "Follow the blue route",
+                      "Jarak" to "Distance",
+                      " dalam " to " in ",
+                      " ke " to " toward ",
+                      " km" to " kilometers",
+                      " m" to " meters",
+                      " min" to " minutes",
+                      " jam " to " hours "
+                  )
+                  for ((from, to) in replacements) result = result.replace(from, to, ignoreCase = false)
+                  return result
+              }
+
+              private fun localizeKelantan(message: String): String {
+                  var result = message
+                  val replacements = listOf(
+                      "Ambil susur masuk kiri; ikut laluan biru untuk naik ke flyover jika ditunjukkan" to "Masuk susur kiri ikut jalan biru kalau kena naik flyover",
+                      "Ambil susur masuk kanan; ikut laluan biru untuk naik ke flyover jika ditunjukkan" to "Masuk susur kanan ikut jalan biru kalau kena naik flyover",
+                      "Keluar melalui susur kiri" to "Keluar ikut susur kiri",
+                      "Keluar melalui susur kanan" to "Keluar ikut susur kanan",
+                      "Di percabangan, ikut jalan kiri" to "Di simpang pecah, ikut jalan kiri",
+                      "Di percabangan, ikut jalan kanan" to "Di simpang pecah, ikut jalan kanan",
+                      "Belok sedikit ke kiri" to "Ambik kiri sikit",
+                      "Belok sedikit ke kanan" to "Ambik kanan sikit",
+                      "Belok tajam ke kiri" to "Ambik kiri tajam",
+                      "Belok tajam ke kanan" to "Ambik kanan tajam",
+                      "Anda tiba di destinasi" to "Demo doh sampai ke destinasi",
+                      "Mulakan perjalanan" to "Mulo perjalanan",
+                      "Navigasi bermula" to "Panduan jalan doh bermula",
+                      "Belok kiri" to "Ambik simpang kiri",
+                      "Belok kanan" to "Ambik simpang kanan",
+                      "Buat pusingan U" to "Pusing balik",
+                      "Teruskan mengikut laluan biru" to "Teruih ikut jalan biru",
+                      "Ikut laluan biru" to "Ikut jalan biru",
+                      " dalam " to " lagi dalam "
+                  )
+                  for ((from, to) in replacements) result = result.replace(from, to, ignoreCase = false)
+                  return result
+              }
+
+              private fun updateNavigationProgress(location: Location) {
+                  updateMetrics(location)
+                  val route = currentRoute ?: return
+                  if (route.steps.isEmpty() || currentStepIndex !in route.steps.indices) return
+                  var step = route.steps[currentStepIndex]
+                  var distance = distanceMeters(location.latitude, location.longitude, step.latitude, step.longitude)
+                  if (navigationStarted && distance < 40.0 && currentStepIndex < route.steps.lastIndex) {
+                      currentStepIndex += 1
+                      step = route.steps[currentStepIndex]
+                      distance = distanceMeters(location.latitude, location.longitude, step.latitude, step.longitude)
+                      speakNavigation(step.instruction, TextToSpeech.QUEUE_ADD, "turn_$currentStepIndex")
+                  }
+                  updateTurnMarker()
+                  if (!navigationStarted) return
+                  nextTurnText.text = when {
+                      step.type == "arrive" -> step.instruction
+                      distance <= 100.0 -> "${step.instruction} — ${formatDistance(distance)}"
+                      else -> "${step.instruction} dalam ${formatDistance(distance)}"
+                  }
+                  updateMetrics(location)
+              }
+
+              private fun checkNearbySpeedCameras"""
+          match = re.search(progress_pattern, source, re.S)
+          if not match:
+              raise SystemExit("Patch stopped: could not locate updateNavigationProgress")
+          source = source[:match.start()] + progress_replacement + source[match.end():]
+
+          replace_once(
+              '        tts?.speak("Amaran. Kamera kelajuan dalam kira-kira ${distance.roundToInt()} meter. Kekalkan had laju.", TextToSpeech.QUEUE_ADD, null, "camera_${nearby.first.id}")\n',
+              '        speakNavigation("Amaran. Kamera kelajuan dalam kira-kira ${distance.roundToInt()} meter. Kekalkan had laju.", TextToSpeech.QUEUE_ADD, "camera_${nearby.first.id}")\n',
+              "camera alert speech",
+          )
+          replace_once(
+              """    override fun onInit(status: Int) {
+                  if (status == TextToSpeech.SUCCESS) {
+                      val result = tts?.setLanguage(Locale("ms", "MY"))
+                      if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                          tts?.setLanguage(Locale("en", "US"))
+                      }
+                  }
+              }
+          """,
+              """    override fun onInit(status: Int) {
+                  if (status == TextToSpeech.SUCCESS) applyTtsLanguage()
+              }
+          """,
+              "TTS language initialization",
+          )
+          source_path.write_text(source, encoding="utf-8")
+
+          drawable_dir = Path("app/src/main/res/drawable")
+          drawable_dir.mkdir(parents=True, exist_ok=True)
+          (drawable_dir / "ic_qm_navigation.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="48dp"
+              android:height="48dp"
+              android:viewportWidth="48"
+              android:viewportHeight="48">
+              <path android:fillColor="#0F172A" android:pathData="M0,0h48v48h-48z" />
+              <path android:fillColor="#FFFFFF" android:fillType="evenOdd"
+                  android:pathData="M24,5 A19,19 0,1 0,24 43 A19,19 0,1 0,24 5 M24,12 A12,12 0,1 1,24 36 A12,12 0,1 1,24 12" />
+              <path android:fillColor="#FFFFFF" android:pathData="M29,29 L44,43 L39,48 L25,34 Z" />
+              <path android:fillColor="#75D38A" android:pathData="M17,18 L23,18 L27,24 L31,18 L37,18 L37,32 L32,32 L32,25 L27,31 L22,25 L22,32 L17,32 Z" />
+          </vector>
+          """, encoding="utf-8")
+
+          manifest_path = Path("app/src/main/AndroidManifest.xml")
+          android_ns = "{http://schemas.android.com/apk/res/android}"
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          ET.register_namespace("tools", "http://schemas.android.com/tools")
+          tree = ET.parse(manifest_path)
+          application = tree.getroot().find("application")
+          if application is None:
+              raise SystemExit("Patch stopped: AndroidManifest.xml has no application element")
+          application.set(android_ns + "icon", "@drawable/ic_qm_navigation")
+          application.set(android_ns + "roundIcon", "@drawable/ic_qm_navigation")
+          tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
+
+          print("Enhanced route colors, junction marker, 100 m zoom, Start button, live metrics, English/Kelantan Malay speech, and Q+M launcher icon.")
+          PY
+
+      - name: Build APK
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: QM-NAVIGASI-enhanced-debug-apk
+          path: buildsrc/QM-NAVIGASI-Android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
