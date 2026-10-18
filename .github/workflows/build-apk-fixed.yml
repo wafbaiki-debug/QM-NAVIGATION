@@ -1,0 +1,138 @@
+name: Build QM NAVIGASI APK - AppCompat Fix
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK
+        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Extract Android project
+        run: unzip -q QM-NAVIGASI-Android-CloudBuild-DIAGNOSTIC.zip -d buildsrc
+
+      - name: Fix AppCompat theme crash
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          ANDROID = "{http://schemas.android.com/apk/res/android}"
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          ET.register_namespace("tools", "http://schemas.android.com/tools")
+
+          manifest_path = Path("app/src/main/AndroidManifest.xml")
+          manifest_tree = ET.parse(manifest_path)
+          manifest_root = manifest_tree.getroot()
+          application = manifest_root.find("application")
+          if application is None:
+              raise SystemExit("AndroidManifest.xml has no <application> element")
+
+          main_activity = next(
+              (node for node in application.iter("activity")
+               if node.get(ANDROID + "name", "").endswith("MainActivity")),
+              None
+          )
+          activity_theme = main_activity.get(ANDROID + "theme") if main_activity is not None else None
+          effective_theme = activity_theme or application.get(ANDROID + "theme")
+          style_name = effective_theme[len("@style/"):] if effective_theme and effective_theme.startswith("@style/") else None
+
+          resource_files = sorted(Path("app/src/main/res").glob("values*/*.xml"))
+          changed_files = set()
+          if style_name:
+              for resource_file in resource_files:
+                  try:
+                      resources_tree = ET.parse(resource_file)
+                  except ET.ParseError:
+                      continue
+                  resources_root = resources_tree.getroot()
+                  found = False
+                  for style in resources_root.findall("style"):
+                      if style.get("name") == style_name:
+                          style.set("parent", "Theme.AppCompat.Light.NoActionBar")
+                          found = True
+                  if found:
+                      resources_tree.write(resource_file, encoding="utf-8", xml_declaration=True)
+                      changed_files.add(str(resource_file))
+
+          if changed_files:
+              print("Updated AppCompat-compatible parent for theme:", style_name)
+              print("Updated resource files:", ", ".join(sorted(changed_files)))
+          else:
+              # If the manifest uses a framework theme or the referenced style cannot be found,
+              # add a dedicated AppCompat theme and assign it to MainActivity.
+              values_dir = Path("app/src/main/res/values")
+              values_dir.mkdir(parents=True, exist_ok=True)
+              styles_path = values_dir / "styles.xml"
+              if styles_path.exists():
+                  styles_tree = ET.parse(styles_path)
+                  styles_root = styles_tree.getroot()
+              else:
+                  styles_root = ET.Element("resources")
+                  styles_tree = ET.ElementTree(styles_root)
+
+              appcompat_style = next(
+                  (node for node in styles_root.findall("style")
+                   if node.get("name") == "QMAppCompatTheme"),
+                  None
+              )
+              if appcompat_style is None:
+                  appcompat_style = ET.SubElement(styles_root, "style", {"name": "QMAppCompatTheme"})
+              appcompat_style.set("parent", "Theme.AppCompat.Light.NoActionBar")
+              styles_tree.write(styles_path, encoding="utf-8", xml_declaration=True)
+
+              if main_activity is not None:
+                  main_activity.set(ANDROID + "theme", "@style/QMAppCompatTheme")
+              else:
+                  application.set(ANDROID + "theme", "@style/QMAppCompatTheme")
+              manifest_tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
+              print("Created and assigned @style/QMAppCompatTheme")
+
+          PY
+
+      - name: Fix Kotlin single-line property
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: sed -i 's/singleLine = true/isSingleLine = true/' app/src/main/java/com/nav3dmalaysia/MainActivity.kt
+
+      - name: Build APK
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: gradle --no-daemon assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: QM-NAVIGASI-debug-apk-appcompat-fix
+          path: buildsrc/QM-NAVIGASI-Android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
