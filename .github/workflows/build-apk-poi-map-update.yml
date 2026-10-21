@@ -1,4 +1,4 @@
-name: Build QM NAVIGASI POI Map Update APK
+name: Build QM NAVIGASI Nyamuk Menggigit APK
 
 on:
   workflow_dispatch:
@@ -865,6 +865,74 @@ jobs:
           print('POI search, direct routing and cache-revalidated online map refresh applied.')
           PY
 
+      - name: Add Nyamuk Menggigit creator and logo
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          
+          path = Path('app/src/main/java/com/nav3dmalaysia/MainActivity.kt')
+          source = path.read_text()
+          old = '        root.addView(header, LinearLayout.LayoutParams(-1, -2))'
+          assert source.count(old) == 1, 'Creator header anchor changed'
+          source = source.replace(old, '''        val brandHeader = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                      setBackgroundColor(Color.rgb(15, 23, 42))
+                  }
+                  val creatorLogo = android.widget.ImageView(this).apply {
+                      setImageResource(com.nav3dmalaysia.R.drawable.ic_nyamuk_menggigit)
+                      contentDescription = "Logo Nyamuk Menggigit"
+                      scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                  }
+                  brandHeader.addView(creatorLogo, LinearLayout.LayoutParams(dp(52), dp(52)))
+                  val brandText = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(10), 0, 0, 0)
+                  }
+                  header.setPadding(0, 0, 0, dp(3))
+                  brandText.addView(header, LinearLayout.LayoutParams(-1, -2))
+                  val creatorText = TextView(this).apply {
+                      text = "Dicipta oleh Nyamuk Menggigit"
+                      textSize = 12f
+                      setTextColor(Color.rgb(253, 224, 71))
+                  }
+                  brandText.addView(creatorText, LinearLayout.LayoutParams(-1, -2))
+                  brandHeader.addView(brandText, LinearLayout.LayoutParams(0, -2, 1f))
+                  root.addView(brandHeader, LinearLayout.LayoutParams(-1, -2))''', 1)
+          path.write_text(source)
+          drawable = Path('app/src/main/res/drawable/ic_nyamuk_menggigit.xml')
+          drawable.parent.mkdir(parents=True, exist_ok=True)
+          drawable.write_text('''<?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="64dp" android:height="64dp"
+              android:viewportWidth="64" android:viewportHeight="64">
+              <path android:fillColor="#1E293B" android:pathData="M32,1 A31,31 0,1 1,32 63 A31,31 0,1 1,32 1" />
+              <!-- Two translucent blue wings, a dark head, and a red striped abdomen. -->
+              <path android:fillColor="#7DD3FC" android:strokeColor="#E0F2FE" android:strokeWidth="1.5"
+                  android:pathData="M31,27 C18,24 8,11 15,8 C22,5 29,16 31,27 Z M33,27 C35,14 44,6 49,11 C55,18 43,26 33,27 Z" />
+              <path android:fillColor="#00000000" android:strokeColor="#CBD5E1" android:strokeWidth="2" android:strokeLineCap="round" android:strokeLineJoin="round"
+                  android:pathData="M29,29 L16,26 L7,32 M30,34 L17,36 L10,46 M34,30 L47,27 L57,32 M36,35 L47,39 L53,50 M32,39 L25,47 L24,56 M37,40 L40,49 L38,57" />
+              <path android:fillColor="#F43F5E" android:strokeColor="#FECDD3" android:strokeWidth="1.4"
+                  android:pathData="M31,28 C27,33 30,44 36,49 C41,43 39,33 34,28 Z" />
+              <path android:fillColor="#00000000" android:strokeColor="#881337" android:strokeWidth="2"
+                  android:pathData="M29,35 L38,33 M31,41 L39,39 M34,46 L38,44" />
+              <path android:fillColor="#F8FAFC" android:pathData="M31,18 A5,5 0,1 1,31 28 A5,5 0,1 1,31 18" />
+              <path android:fillColor="#0F172A" android:pathData="M29,20 A1.3,1.3 0,1 1,29 22.6 A1.3,1.3 0,1 1,29 20" />
+              <path android:fillColor="#00000000" android:strokeColor="#F8FAFC" android:strokeWidth="1.6" android:strokeLineCap="round"
+                  android:pathData="M28,19 L24,13 M34,19 L36,12 M27,25 L13,43" />
+              <!-- Bite/drop at the tip of the proboscis. -->
+              <path android:fillColor="#FB7185" android:pathData="M13,41 C11,44 9,46 9,48 A4,4 0,0 0,17 48 C17,46 15,44 13,41 Z" />
+          </vector>
+          ''')
+          gradle = Path('app/build.gradle.kts')
+          config = gradle.read_text()
+          assert 'versionCode = 2' in config and 'versionName = "1.1.0"' in config
+          gradle.write_text(config.replace('versionCode = 2', 'versionCode = 3').replace('versionName = "1.1.0"', 'versionName = "1.1.1"'))
+          print('Creator credit and Nyamuk Menggigit logo added to the main header.')
+          PY
+
       - name: Build APK
         working-directory: buildsrc/QM-NAVIGASI-Android
         run: gradle --no-daemon assembleDebug
@@ -872,7 +940,7 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: QM-NAVIGASI-POI-map-update-debug-apk
+          name: QM-NAVIGASI-Nyamuk-Menggigit-debug-apk
           path: buildsrc/QM-NAVIGASI-Android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
