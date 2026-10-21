@@ -1209,7 +1209,21 @@ jobs:
           path.write_text(source, encoding="utf-8")
           print("TomTom-style navigation display applied: 3D follow camera, stronger blue route, visible turn banner, dark HUD.")
           PY
-
+      - name: Switch base map to dark style
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("app/src/main/java/com/nav3dmalaysia/MainActivity.kt")
+          source = path.read_text(encoding="utf-8")
+          old = "https://tiles.openfreemap.org/styles/liberty"
+          new = "https://tiles.openfreemap.org/styles/dark"
+          count = source.count(old)
+          if count != 1:
+              raise SystemExit(f"Expected one base map style URL, found {count}")
+          path.write_text(source.replace(old, new, 1), encoding="utf-8")
+          print("Base map style switched to OpenFreeMap Dark.")
+          PY
       - name: Build APK
         working-directory: buildsrc/QM-NAVIGASI-Android
         run: gradle --no-daemon testDebugUnitTest assembleDebug
