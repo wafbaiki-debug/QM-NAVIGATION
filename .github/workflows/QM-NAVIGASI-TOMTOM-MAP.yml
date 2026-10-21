@@ -1,0 +1,1224 @@
+name: Build QM NAVIGASI TomTom Style Map APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK
+        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Extract Android project
+        run: unzip -q QM-NAVIGASI-Android-CloudBuild-DIAGNOSTIC.zip -d buildsrc
+
+      - name: Fix AppCompat theme crash
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          ANDROID = "{http://schemas.android.com/apk/res/android}"
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          ET.register_namespace("tools", "http://schemas.android.com/tools")
+          manifest_path = Path("app/src/main/AndroidManifest.xml")
+          manifest_tree = ET.parse(manifest_path)
+          manifest_root = manifest_tree.getroot()
+          application = manifest_root.find("application")
+          if application is None:
+              raise SystemExit("AndroidManifest.xml has no application element")
+          main_activity = next((node for node in application.iter("activity")
+                                if node.get(ANDROID + "name", "").endswith("MainActivity")), None)
+          activity_theme = main_activity.get(ANDROID + "theme") if main_activity is not None else None
+          effective_theme = activity_theme or application.get(ANDROID + "theme")
+          style_name = effective_theme[len("@style/"):] if effective_theme and effective_theme.startswith("@style/") else None
+          resource_files = sorted(Path("app/src/main/res").glob("values*/*.xml"))
+          changed = False
+          if style_name:
+              for resource_file in resource_files:
+                  try:
+                      resource_tree = ET.parse(resource_file)
+                  except ET.ParseError:
+                      continue
+                  for style in resource_tree.getroot().findall("style"):
+                      if style.get("name") == style_name:
+                          style.set("parent", "Theme.AppCompat.Light.NoActionBar")
+                          resource_tree.write(resource_file, encoding="utf-8", xml_declaration=True)
+                          changed = True
+          if not changed:
+              values_dir = Path("app/src/main/res/values")
+              values_dir.mkdir(parents=True, exist_ok=True)
+              styles_path = values_dir / "styles.xml"
+              if styles_path.exists():
+                  styles_tree = ET.parse(styles_path)
+                  styles_root = styles_tree.getroot()
+              else:
+                  styles_root = ET.Element("resources")
+                  styles_tree = ET.ElementTree(styles_root)
+              appcompat_style = next((node for node in styles_root.findall("style")
+                                      if node.get("name") == "QMAppCompatTheme"), None)
+              if appcompat_style is None:
+                  appcompat_style = ET.SubElement(styles_root, "style", {"name": "QMAppCompatTheme"})
+              appcompat_style.set("parent", "Theme.AppCompat.Light.NoActionBar")
+              styles_tree.write(styles_path, encoding="utf-8", xml_declaration=True)
+              if main_activity is not None:
+                  main_activity.set(ANDROID + "theme", "@style/QMAppCompatTheme")
+              else:
+                  application.set(ANDROID + "theme", "@style/QMAppCompatTheme")
+              manifest_tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
+          PY
+
+      - name: Fix Kotlin single-line property
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: sed -i 's/singleLine = true/isSingleLine = true/' app/src/main/java/com/nav3dmalaysia/MainActivity.kt
+
+      - name: Apply navigation improvements
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import xml.etree.ElementTree as ET
+
+          source_path = Path("app/src/main/java/com/nav3dmalaysia/MainActivity.kt")
+          source = source_path.read_text(encoding="utf-8")
+
+          def replace_once(old, new, label):
+              global source
+              count = source.count(old)
+              if count != 1:
+                  raise SystemExit(f"Patch stopped: expected one match for {label}, found {count}")
+              source = source.replace(old, new, 1)
+
+          replace_once(
+              "import android.widget.Button\nimport android.widget.EditText\n",
+              "import android.widget.ArrayAdapter\nimport android.widget.Button\nimport android.widget.EditText\nimport android.widget.Spinner\n",
+              "widget imports",
+          )
+          replace_once(
+              '        private const val ROUTE_LAYER = "nav-route-layer"\n        private const val CAMERA_SOURCE = "nav-camera-source"\n',
+              '        private const val ROUTE_LAYER = "nav-route-layer"\n        private const val ROUTE_CASING_LAYER = "nav-route-casing-layer"\n        private const val TURN_SOURCE = "nav-turn-source"\n        private const val TURN_LAYER = "nav-turn-layer"\n        private const val CAMERA_SOURCE = "nav-camera-source"\n',
+              "map layer constants",
+          )
+          replace_once(
+              "    private lateinit var nextTurnText: TextView\n    private lateinit var instructionsText: TextView\n    private lateinit var cameraButton: Button\n",
+              "    private lateinit var nextTurnText: TextView\n    private lateinit var metricsText: TextView\n    private lateinit var routeLegendText: TextView\n    private lateinit var instructionsText: TextView\n    private lateinit var cameraButton: Button\n    private lateinit var startNavigationButton: Button\n    private lateinit var voiceLanguageSpinner: Spinner\n",
+              "UI fields",
+          )
+          replace_once(
+              "    private var currentStepIndex = 0\n    private var cameraPoints: List<SpeedCamera> = emptyList()\n",
+              '    private var currentStepIndex = 0\n    private var navigationStarted = false\n    private var voiceLanguage = "kelantan"\n    private var cameraPoints: List<SpeedCamera> = emptyList()\n',
+              "navigation state",
+          )
+          replace_once(
+              "                            .zoom(16.5)\n                            .bearing(bearing)\n",
+              "                            .zoom(nextCameraZoom(location))\n                            .bearing(bearing)\n",
+              "automatic turn zoom",
+          )
+          replace_once(
+              """        listOf(gpsButton, threeDButton, cameraButton).forEachIndexed { index, button ->
+                      val params = LinearLayout.LayoutParams(0, dp(42), if (index == 2) 1.35f else 1f)
+                      if (index > 0) params.marginStart = dp(5)
+                      controls.addView(button, params)
+                  }
+                  root.addView(controls, LinearLayout.LayoutParams(-1, -2))
+          """,
+              """        startNavigationButton = makeButton("MULA")
+                  startNavigationButton.isEnabled = false
+                  startNavigationButton.setOnClickListener { startNavigation() }
+                  listOf(gpsButton, threeDButton, cameraButton, startNavigationButton).forEachIndexed { index, button ->
+                      val weight = if (index == 2) 1.2f else 1f
+                      val params = LinearLayout.LayoutParams(0, dp(42), weight)
+                      if (index > 0) params.marginStart = dp(4)
+                      controls.addView(button, params)
+                  }
+                  root.addView(controls, LinearLayout.LayoutParams(-1, -2))
+
+                  val voiceRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(12), 0, dp(12), dp(5))
+                  }
+                  val voiceLabel = TextView(this).apply {
+                      text = "SUARA:"
+                      textSize = 12f
+                      setTextColor(Color.rgb(51, 65, 85))
+                  }
+                  voiceRow.addView(voiceLabel, LinearLayout.LayoutParams(-2, dp(40)))
+                  voiceLanguageSpinner = Spinner(this)
+                  val voiceAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, listOf("Melayu Kelantan", "English"))
+                  voiceAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+                  voiceLanguageSpinner.adapter = voiceAdapter
+                  voiceLanguageSpinner.setSelection(0)
+                  voiceLanguageSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                      override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                          voiceLanguage = if (position == 1) "english" else "kelantan"
+                          applyTtsLanguage()
+                      }
+                      override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+                  }
+                  val voiceSpinnerParams = LinearLayout.LayoutParams(0, dp(40), 1f)
+                  voiceSpinnerParams.marginStart = dp(8)
+                  voiceRow.addView(voiceLanguageSpinner, voiceSpinnerParams)
+                  root.addView(voiceRow, LinearLayout.LayoutParams(-1, -2))
+          """,
+              "start and voice controls",
+          )
+          replace_once(
+              "        nextTurnText = TextView(this).apply {\n",
+              """        metricsText = TextView(this).apply {
+                      text = "Kelajuan: -- km/j  •  Ke destinasi: --  •  Baki: --"
+                      textSize = 12f
+                      setTextColor(Color.rgb(30, 41, 59))
+                      setPadding(0, dp(4), 0, dp(3))
+                  }
+                  routeLegendText = TextView(this).apply {
+                      text = "PETUNJUK: Biru terang = laluan dipilih  •  Jalan lain = kelabu  •  Simpang seterusnya = jingga"
+                      textSize = 10f
+                      setTextColor(Color.rgb(100, 116, 139))
+                      setPadding(0, dp(2), 0, dp(3))
+                  }
+                  nextTurnText = TextView(this).apply {
+          """,
+              "metrics and route legend",
+          )
+          replace_once(
+              "        bottomPanel.addView(statusText, LinearLayout.LayoutParams(-1, -2))\n        bottomPanel.addView(nextTurnText, LinearLayout.LayoutParams(-1, -2))\n",
+              "        bottomPanel.addView(statusText, LinearLayout.LayoutParams(-1, -2))\n        bottomPanel.addView(metricsText, LinearLayout.LayoutParams(-1, -2))\n        bottomPanel.addView(nextTurnText, LinearLayout.LayoutParams(-1, -2))\n        bottomPanel.addView(routeLegendText, LinearLayout.LayoutParams(-1, -2))\n",
+              "bottom panel rows",
+          )
+          replace_once(
+              '            style.addSource(GeoJsonSource(ROUTE_SOURCE, EMPTY_FEATURE_COLLECTION))\n            style.addSource(GeoJsonSource(CAMERA_SOURCE, EMPTY_FEATURE_COLLECTION))\n',
+              '            style.addSource(GeoJsonSource(ROUTE_SOURCE, EMPTY_FEATURE_COLLECTION))\n            style.addSource(GeoJsonSource(TURN_SOURCE, EMPTY_FEATURE_COLLECTION))\n            style.addSource(GeoJsonSource(CAMERA_SOURCE, EMPTY_FEATURE_COLLECTION))\n',
+              "turn marker source",
+          )
+          replace_once(
+              """            style.addLayer(
+                          LineLayer(ROUTE_LAYER, ROUTE_SOURCE).withProperties(
+                              lineColor("#2563EB"),
+                              lineWidth(6f),
+                              lineCap(Property.LINE_CAP_ROUND),
+                              lineJoin(Property.LINE_JOIN_ROUND)
+                          )
+                      )
+                      style.addLayer(
+                          CircleLayer(CAMERA_LAYER, CAMERA_SOURCE).withProperties(
+          """,
+              """            // White casing makes the selected route visible over junctions and flyovers.
+                      style.addLayer(
+                          LineLayer(ROUTE_CASING_LAYER, ROUTE_SOURCE).withProperties(
+                              lineColor("#FFFFFF"),
+                              lineWidth(10f),
+                              lineCap(Property.LINE_CAP_ROUND),
+                              lineJoin(Property.LINE_JOIN_ROUND)
+                          )
+                      )
+                      style.addLayer(
+                          LineLayer(ROUTE_LAYER, ROUTE_SOURCE).withProperties(
+                              lineColor("#005BFF"),
+                              lineWidth(6f),
+                              lineCap(Property.LINE_CAP_ROUND),
+                              lineJoin(Property.LINE_JOIN_ROUND)
+                          )
+                      )
+                      style.addLayer(
+                          CircleLayer(TURN_LAYER, TURN_SOURCE).withProperties(
+                              circleRadius(9f),
+                              circleColor("#F97316"),
+                              circleStrokeColor("#FFFFFF"),
+                              circleStrokeWidth(3f)
+                          )
+                      )
+                      style.addLayer(
+                          CircleLayer(CAMERA_LAYER, CAMERA_SOURCE).withProperties(
+          """,
+              "route casing and turn marker layers",
+          )
+          replace_once(
+              """                    currentRoute = route
+                              currentStepIndex = route.steps.indexOfFirst { it.type != "depart" }.let { if (it >= 0) it else 0 }
+                              warnedCameraIds.clear()
+                              followGps = true
+                              currentStyle?.getSourceAs<GeoJsonSource>(ROUTE_SOURCE)?.setGeoJson(route.geoJson)
+          """,
+              """                    currentRoute = route
+                              currentStepIndex = route.steps.indexOfFirst { it.type != "depart" }.let { if (it >= 0) it else 0 }
+                              navigationStarted = false
+                              startNavigationButton.text = "MULA"
+                              startNavigationButton.isEnabled = true
+                              warnedCameraIds.clear()
+                              followGps = true
+                              currentStyle?.getSourceAs<GeoJsonSource>(ROUTE_SOURCE)?.setGeoJson(route.geoJson)
+                              updateTurnMarker()
+          """,
+              "route ready and start button",
+          )
+          replace_once(
+              '                    loadSpeedCameras(route.coordinates, route.distanceMeters)\n',
+              '                    updateMetrics(currentLocation)\n                    loadSpeedCameras(route.coordinates, route.distanceMeters)\n',
+              "initial metrics",
+          )
+          replace_once(
+              '                    tts?.speak("Laluan ditemui. Jarak ${formatDistance(route.distanceMeters)}. ${route.steps.getOrNull(currentStepIndex)?.instruction ?: "Ikut garisan biru."}", TextToSpeech.QUEUE_FLUSH, null, "route_start")\n',
+              '                    speakNavigation("Laluan ditemui. Jarak ${formatDistance(route.distanceMeters)}. Tekan Mula untuk memulakan panduan.", TextToSpeech.QUEUE_FLUSH, "route_ready")\n',
+              "route-ready speech",
+          )
+
+          maneuver_pattern = r"    private fun describeManeuver\(type: String, modifier: String, road: String\): String \{.*?\n    \}\n"
+          maneuver_replacement = """    private fun describeManeuver(type: String, modifier: String, road: String): String {
+                  val side = modifier.lowercase(Locale.ROOT)
+                  val action = when (type.lowercase(Locale.ROOT)) {
+                      "depart" -> "Mulakan perjalanan"
+                      "arrive" -> "Anda tiba di destinasi"
+                      "turn", "end of road" -> when (side) {
+                          "left" -> "Belok kiri"
+                          "right" -> "Belok kanan"
+                          "slight left" -> "Belok sedikit ke kiri"
+                          "slight right" -> "Belok sedikit ke kanan"
+                          "sharp left" -> "Belok tajam ke kiri"
+                          "sharp right" -> "Belok tajam ke kanan"
+                          "uturn", "u-turn" -> "Buat pusingan U"
+                          else -> "Belok mengikut laluan biru"
+                      }
+                      "on ramp" -> when (side) {
+                          "left", "slight left", "sharp left" -> "Ambil susur masuk kiri; ikut laluan biru untuk naik ke flyover jika ditunjukkan"
+                          "right", "slight right", "sharp right" -> "Ambil susur masuk kanan; ikut laluan biru untuk naik ke flyover jika ditunjukkan"
+                          else -> "Masuk ke jalan susur yang diserlahkan biru"
+                      }
+                      "off ramp" -> when (side) {
+                          "left", "slight left", "sharp left" -> "Keluar melalui susur kiri yang diserlahkan biru"
+                          "right", "slight right", "sharp right" -> "Keluar melalui susur kanan yang diserlahkan biru"
+                          else -> "Keluar melalui jalan susur yang diserlahkan biru"
+                      }
+                      "fork" -> when (side) {
+                          "left", "slight left", "sharp left" -> "Di percabangan, ikut jalan kiri yang berwarna biru"
+                          "right", "slight right", "sharp right" -> "Di percabangan, ikut jalan kanan yang berwarna biru"
+                          else -> "Di percabangan, ikut jalan yang berwarna biru"
+                      }
+                      "merge" -> when (side) {
+                          "left", "slight left" -> "Masuk ke laluan utama dari kiri"
+                          "right", "slight right" -> "Masuk ke laluan utama dari kanan"
+                          else -> "Cantum ke laluan utama yang berwarna biru"
+                      }
+                      "roundabout", "rotary" -> "Masuk bulatan dan ikut laluan biru"
+                      "roundabout turn" -> "Ikut bulatan mengikut laluan biru"
+                      "exit roundabout" -> when (side) {
+                          "left", "slight left" -> "Keluar bulatan ke kiri"
+                          "right", "slight right" -> "Keluar bulatan ke kanan"
+                          else -> "Keluar bulatan mengikut laluan biru"
+                      }
+                      "continue", "new name" -> "Teruskan mengikut laluan biru"
+                      else -> "Ikut laluan biru dan jangan ambil jalan kelabu"
+                  }
+                  return if (road.isNotBlank() && type.lowercase(Locale.ROOT) !in setOf("depart", "arrive")) "$action ke $road" else action
+              }
+          """
+          match = re.search(maneuver_pattern, source, re.S)
+          if not match:
+              raise SystemExit("Patch stopped: could not locate describeManeuver")
+          source = source[:match.start()] + maneuver_replacement + source[match.end():]
+
+          progress_pattern = r"    private fun updateNavigationProgress\(location: Location\) \{.*?\n    \}\n\n    private fun checkNearbySpeedCameras"
+          progress_replacement = """    private fun startNavigation() {
+                  val route = currentRoute
+                  if (route == null) {
+                      statusText.text = "Cari destinasi dahulu, kemudian tekan MULA."
+                      return
+                  }
+                  navigationStarted = true
+                  followGps = true
+                  startNavigationButton.text = "AKTIF"
+                  startNavigationButton.isEnabled = false
+                  currentLocation?.let {
+                      updateNavigationProgress(it)
+                      focusOnLocation(it, nextCameraZoom(it))
+                  }
+                  val instruction = route.steps.getOrNull(currentStepIndex)?.instruction ?: "Ikut laluan biru"
+                  speakNavigation("Navigasi bermula. $instruction", TextToSpeech.QUEUE_FLUSH, "navigation_start")
+              }
+
+              private fun nextCameraZoom(location: Location): Double {
+                  val step = currentRoute?.steps?.getOrNull(currentStepIndex) ?: return 16.5
+                  val distance = distanceMeters(location.latitude, location.longitude, step.latitude, step.longitude)
+                  return if (navigationStarted && distance <= 100.0) 18.5 else 16.5
+              }
+
+              private fun updateTurnMarker() {
+                  val step = currentRoute?.steps?.getOrNull(currentStepIndex)
+                  val json = if (step == null) {
+                      EMPTY_FEATURE_COLLECTION
+                  } else {
+                      JSONObject()
+                          .put("type", "FeatureCollection")
+                          .put("features", JSONArray().put(JSONObject()
+                              .put("type", "Feature")
+                              .put("geometry", JSONObject().put("type", "Point")
+                                  .put("coordinates", JSONArray().put(step.longitude).put(step.latitude)))
+                              .put("properties", JSONObject())))
+                          .toString()
+                  }
+                  currentStyle?.getSourceAs<GeoJsonSource>(TURN_SOURCE)?.setGeoJson(json)
+              }
+
+              private fun updateMetrics(location: Location?) {
+                  val speedKmh = if (location != null && location.hasSpeed()) (location.speed * 3.6f).roundToInt() else 0
+                  val route = currentRoute
+                  if (route == null) {
+                      metricsText.text = "Kelajuan: $speedKmh km/j  •  Ke destinasi: --  •  Baki: --"
+                      return
+                  }
+                  val step = route.steps.getOrNull(currentStepIndex)
+                  val toTurn = if (location != null && step != null) {
+                      distanceMeters(location.latitude, location.longitude, step.latitude, step.longitude)
+                  } else 0.0
+                  val remainingDistance = if (step == null) 0.0 else
+                      (toTurn + route.steps.drop(currentStepIndex + 1).sumOf { it.distanceMeters }).coerceAtMost(route.distanceMeters)
+                  val remainingSeconds = if (route.distanceMeters > 0.0) route.durationSeconds * (remainingDistance / route.distanceMeters) else 0.0
+                  metricsText.text = "Kelajuan: $speedKmh km/j  •  Ke destinasi: ${formatDistance(remainingDistance)}  •  Baki: ${formatDuration(remainingSeconds)}"
+              }
+
+              private fun applyTtsLanguage() {
+                  val engine = tts ?: return
+                  val preferred = if (voiceLanguage == "english") Locale.US else Locale("ms", "MY")
+                  val result = engine.setLanguage(preferred)
+                  if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                      engine.setLanguage(if (voiceLanguage == "english") Locale.ENGLISH else Locale("ms"))
+                  }
+              }
+
+              private fun speakNavigation(message: String, queueMode: Int, utteranceId: String) {
+                  val spoken = if (voiceLanguage == "english") localizeEnglish(message) else localizeKelantan(message)
+                  tts?.speak(spoken, queueMode, null, utteranceId)
+              }
+
+              private fun localizeEnglish(message: String): String {
+                  var result = message
+                  val replacements = listOf(
+                      "Ambil susur masuk kiri; ikut laluan biru untuk naik ke flyover jika ditunjukkan" to "Take the left ramp onto the flyover if shown by the blue route",
+                      "Ambil susur masuk kanan; ikut laluan biru untuk naik ke flyover jika ditunjukkan" to "Take the right ramp onto the flyover if shown by the blue route",
+                      "Keluar melalui jalan susur yang diserlahkan biru" to "Take the blue exit ramp",
+                      "Masuk ke jalan susur yang diserlahkan biru" to "Take the blue entrance ramp",
+                      "Di percabangan, ikut jalan kiri" to "At the fork, take the left road",
+                      "Di percabangan, ikut jalan kanan" to "At the fork, take the right road",
+                      "Belok sedikit ke kiri" to "Bear slightly left",
+                      "Belok sedikit ke kanan" to "Bear slightly right",
+                      "Belok tajam ke kiri" to "Turn sharply left",
+                      "Belok tajam ke kanan" to "Turn sharply right",
+                      "Anda tiba di destinasi" to "You have arrived at your destination",
+                      "Mulakan perjalanan" to "Start your journey",
+                      "Laluan ditemui" to "Route found",
+                      "Navigasi bermula" to "Navigation started",
+                      "Belok kiri" to "Turn left",
+                      "Belok kanan" to "Turn right",
+                      "Buat pusingan U" to "Make a U-turn",
+                      "Teruskan mengikut laluan biru" to "Continue along the blue route",
+                      "Ikut laluan biru" to "Follow the blue route",
+                      "Jarak" to "Distance",
+                      " dalam " to " in ",
+                      " ke " to " toward ",
+                      " km" to " kilometers",
+                      " m" to " meters",
+                      " min" to " minutes",
+                      " jam " to " hours "
+                  )
+                  for ((from, to) in replacements) result = result.replace(from, to, ignoreCase = false)
+                  return result
+              }
+
+              private fun localizeKelantan(message: String): String {
+                  var result = message
+                  val replacements = listOf(
+                      "Ambil susur masuk kiri; ikut laluan biru untuk naik ke flyover jika ditunjukkan" to "Masuk susur kiri ikut jalan biru kalau kena naik flyover",
+                      "Ambil susur masuk kanan; ikut laluan biru untuk naik ke flyover jika ditunjukkan" to "Masuk susur kanan ikut jalan biru kalau kena naik flyover",
+                      "Keluar melalui susur kiri" to "Keluar ikut susur kiri",
+                      "Keluar melalui susur kanan" to "Keluar ikut susur kanan",
+                      "Di percabangan, ikut jalan kiri" to "Di simpang pecah, ikut jalan kiri",
+                      "Di percabangan, ikut jalan kanan" to "Di simpang pecah, ikut jalan kanan",
+                      "Belok sedikit ke kiri" to "Ambik kiri sikit",
+                      "Belok sedikit ke kanan" to "Ambik kanan sikit",
+                      "Belok tajam ke kiri" to "Ambik kiri tajam",
+                      "Belok tajam ke kanan" to "Ambik kanan tajam",
+                      "Anda tiba di destinasi" to "Demo doh sampai ke destinasi",
+                      "Mulakan perjalanan" to "Mulo perjalanan",
+                      "Navigasi bermula" to "Panduan jalan doh bermula",
+                      "Belok kiri" to "Ambik simpang kiri",
+                      "Belok kanan" to "Ambik simpang kanan",
+                      "Buat pusingan U" to "Pusing balik",
+                      "Teruskan mengikut laluan biru" to "Teruih ikut jalan biru",
+                      "Ikut laluan biru" to "Ikut jalan biru",
+                      " dalam " to " lagi dalam "
+                  )
+                  for ((from, to) in replacements) result = result.replace(from, to, ignoreCase = false)
+                  return result
+              }
+
+              private fun updateNavigationProgress(location: Location) {
+                  updateMetrics(location)
+                  val route = currentRoute ?: return
+                  if (route.steps.isEmpty() || currentStepIndex !in route.steps.indices) return
+                  var step = route.steps[currentStepIndex]
+                  var distance = distanceMeters(location.latitude, location.longitude, step.latitude, step.longitude)
+                  if (navigationStarted && distance < 40.0 && currentStepIndex < route.steps.lastIndex) {
+                      currentStepIndex += 1
+                      step = route.steps[currentStepIndex]
+                      distance = distanceMeters(location.latitude, location.longitude, step.latitude, step.longitude)
+                      speakNavigation(step.instruction, TextToSpeech.QUEUE_ADD, "turn_$currentStepIndex")
+                  }
+                  updateTurnMarker()
+                  if (!navigationStarted) return
+                  nextTurnText.text = when {
+                      step.type == "arrive" -> step.instruction
+                      distance <= 100.0 -> "${step.instruction} — ${formatDistance(distance)}"
+                      else -> "${step.instruction} dalam ${formatDistance(distance)}"
+                  }
+                  updateMetrics(location)
+              }
+
+              private fun checkNearbySpeedCameras"""
+          match = re.search(progress_pattern, source, re.S)
+          if not match:
+              raise SystemExit("Patch stopped: could not locate updateNavigationProgress")
+          source = source[:match.start()] + progress_replacement + source[match.end():]
+
+          replace_once(
+              '        tts?.speak("Amaran. Kamera kelajuan dalam kira-kira ${distance.roundToInt()} meter. Kekalkan had laju.", TextToSpeech.QUEUE_ADD, null, "camera_${nearby.first.id}")\n',
+              '        speakNavigation("Amaran. Kamera kelajuan dalam kira-kira ${distance.roundToInt()} meter. Kekalkan had laju.", TextToSpeech.QUEUE_ADD, "camera_${nearby.first.id}")\n',
+              "camera alert speech",
+          )
+          replace_once(
+              """    override fun onInit(status: Int) {
+                  if (status == TextToSpeech.SUCCESS) {
+                      val result = tts?.setLanguage(Locale("ms", "MY"))
+                      if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+                          tts?.setLanguage(Locale("en", "US"))
+                      }
+                  }
+              }
+          """,
+              """    override fun onInit(status: Int) {
+                  if (status == TextToSpeech.SUCCESS) applyTtsLanguage()
+              }
+          """,
+              "TTS language initialization",
+          )
+          source_path.write_text(source, encoding="utf-8")
+
+          drawable_dir = Path("app/src/main/res/drawable")
+          drawable_dir.mkdir(parents=True, exist_ok=True)
+          (drawable_dir / "ic_qm_navigation.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="48dp"
+              android:height="48dp"
+              android:viewportWidth="48"
+              android:viewportHeight="48">
+              <path android:fillColor="#0F172A" android:pathData="M0,0h48v48h-48z" />
+              <path android:fillColor="#FFFFFF" android:fillType="evenOdd"
+                  android:pathData="M24,5 A19,19 0,1 0,24 43 A19,19 0,1 0,24 5 M24,12 A12,12 0,1 1,24 36 A12,12 0,1 1,24 12" />
+              <path android:fillColor="#FFFFFF" android:pathData="M29,29 L44,43 L39,48 L25,34 Z" />
+              <path android:fillColor="#75D38A" android:pathData="M17,18 L23,18 L27,24 L31,18 L37,18 L37,32 L32,32 L32,25 L27,31 L22,25 L22,32 L17,32 Z" />
+          </vector>
+          """, encoding="utf-8")
+
+          manifest_path = Path("app/src/main/AndroidManifest.xml")
+          android_ns = "{http://schemas.android.com/apk/res/android}"
+          ET.register_namespace("android", "http://schemas.android.com/apk/res/android")
+          ET.register_namespace("tools", "http://schemas.android.com/tools")
+          tree = ET.parse(manifest_path)
+          application = tree.getroot().find("application")
+          if application is None:
+              raise SystemExit("Patch stopped: AndroidManifest.xml has no application element")
+          application.set(android_ns + "icon", "@drawable/ic_qm_navigation")
+          application.set(android_ns + "roundIcon", "@drawable/ic_qm_navigation")
+          tree.write(manifest_path, encoding="utf-8", xml_declaration=True)
+
+          print("Enhanced route colors, junction marker, 100 m zoom, Start button, live metrics, English/Kelantan Malay speech, and Q+M launcher icon.")
+          PY
+
+      - name: Add POIs and online map refresh
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: |
+          python3 - <<'PY'
+          """Add nearby OSM POIs and server-validated map refresh after enhanced-6 patches."""
+          from pathlib import Path
+          
+          path = Path('app/src/main/java/com/nav3dmalaysia/MainActivity.kt')
+          source = path.read_text()
+          
+          def replace(old, new):
+              global source
+              if source.count(old) != 1:
+                  raise SystemExit(f'POI patch: expected one match: {old[:90]!r}')
+              source = source.replace(old, new, 1)
+          
+          replace('import android.Manifest\n', 'import android.Manifest\nimport androidx.appcompat.app.AlertDialog\nimport org.maplibre.android.offline.OfflineManager\nimport android.os.SystemClock\n')
+          replace('    private var map: MapLibreMap? = null', '''    private lateinit var poiCategorySpinner: Spinner
+              private lateinit var poiStatusText: TextView
+              private lateinit var poiSearchButton: Button
+              private lateinit var mapRefreshButton: Button
+              private var poiPoints: List<Poi> = emptyList()
+              private var poiRequestId = 0
+              private var poiLoading = false
+              private var poiRefreshPending = false
+              private var poiLastAttempt = 0L
+              private var poiSearchCenter: GeoPoint? = null
+              private var mapRefreshing = false
+              private val poiCategories = listOf(
+                  "Semua POI", "Stesen minyak", "Restoran / kafe", "Hospital / klinik",
+                  "Masjid / surau", "ATM / bank", "Parkir", "Kedai / pasar raya", "Tarikan pelancongan"
+              )
+              private var map: MapLibreMap? = null''')
+          replace('        mapView = MapView(this)', '''        val poiRow = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(8), 0, dp(8), dp(3))
+                  }
+                  poiCategorySpinner = Spinner(this).apply {
+                      adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, poiCategories)
+                  }
+                  poiRow.addView(poiCategorySpinner, LinearLayout.LayoutParams(0, dp(44), 1f))
+                  poiSearchButton = makeButton("CARI POI")
+                  poiSearchButton.setOnClickListener { loadNearbyPois(showList = true) }
+                  poiRow.addView(poiSearchButton, LinearLayout.LayoutParams(dp(90), dp(44)))
+                  mapRefreshButton = makeButton("KEMAS KINI")
+                  mapRefreshButton.setOnClickListener { refreshOnlineMap() }
+                  poiRow.addView(mapRefreshButton, LinearLayout.LayoutParams(dp(96), dp(44)))
+                  root.addView(poiRow, LinearLayout.LayoutParams(-1, -2))
+                  poiStatusText = TextView(this).apply {
+                      text = "POI hijau • Radius 3 km dari tengah peta • Ketik penanda untuk navigasi"
+                      textSize = 11f
+                      setTextColor(Color.rgb(51, 65, 85))
+                      setPadding(dp(12), 0, dp(12), dp(4))
+                  }
+                  root.addView(poiStatusText, LinearLayout.LayoutParams(-1, -2))
+          
+                  mapView = MapView(this)''')
+          replace('                readyMap.uiSettings.isCompassEnabled = true', '''                readyMap.uiSettings.isCompassEnabled = true
+                          readyMap.addOnMapClickListener { coordinate ->
+                              val projection = readyMap.projection
+                              val tap = projection.toScreenLocation(coordinate)
+                              val nearest = poiPoints.minByOrNull {
+                                  val pixel = projection.toScreenLocation(LatLng(it.point.latitude, it.point.longitude))
+                                  val dx = pixel.x - tap.x
+                                  val dy = pixel.y - tap.y
+                                  dx * dx + dy * dy
+                              }
+                              if (nearest == null) false else {
+                                  val pixel = projection.toScreenLocation(LatLng(nearest.point.latitude, nearest.point.longitude))
+                                  val dx = pixel.x - tap.x
+                                  val dy = pixel.y - tap.y
+                                  if (dx * dx + dy * dy <= dp(24) * dp(24)) {
+                                      showPoiDetails(nearest)
+                                      true
+                                  } else false
+                              }
+                          }
+                          readyMap.addOnCameraIdleListener {
+                              val previous = poiSearchCenter
+                              val center = readyMap.cameraPosition.target
+                              if (!mapRefreshing && !poiLoading && previous != null && center != null &&
+                                  SystemClock.elapsedRealtime() - poiLastAttempt > 60000L &&
+                                  distanceMeters(previous.latitude, previous.longitude, center.latitude, center.longitude) > 1500.0) {
+                                  loadNearbyPois()
+                              }
+                          }''')
+          # Begin querying after the initial camera target has been assigned.
+          replace('                    } catch (error: Throwable) {\n                        android.util.Log.e("QM_NAVIGASI", "Map style setup failed", error)', '''                        loadNearbyPois()
+                              } catch (error: Throwable) {
+                                  android.util.Log.e("QM_NAVIGASI", "Map style setup failed", error)''')
+          replace('            style.addSource(GeoJsonSource(USER_SOURCE, EMPTY_FEATURE_COLLECTION))', '''            style.addSource(GeoJsonSource(USER_SOURCE, EMPTY_FEATURE_COLLECTION))
+                      style.addSource(GeoJsonSource("nav-poi-source", EMPTY_FEATURE_COLLECTION))
+                      style.addLayer(CircleLayer("nav-poi-layer", "nav-poi-source").withProperties(
+                          circleRadius(7f), circleColor("#15803D"),
+                          circleStrokeColor("#FFFFFF"), circleStrokeWidth(2f)
+                      ))''')
+          replace('            refreshCameraLayer()\n        } catch (error: Exception)', '''            refreshCameraLayer()
+                      refreshPoiLayer()
+                      currentRoute?.let { style.getSourceAs<GeoJsonSource>(ROUTE_SOURCE)?.setGeoJson(it.geoJson) }
+                      updateTurnMarker()
+                  } catch (error: Exception)''')
+          replace('    private fun findRoute() {', '    private fun findRoute(poiTarget: GeoPoint? = null) {')
+          replace('                val target = geocodeDestination(query)', '                val target = poiTarget ?: geocodeDestination(query)')
+          
+          methods = r'''
+              private data class Poi(val id: String, val name: String, val category: String, val point: GeoPoint)
+          
+              private fun poiSelector(category: Int): String = when (category) {
+                  1 -> "[\"amenity\"=\"fuel\"]"
+                  2 -> "[\"amenity\"~\"^(restaurant|cafe|fast_food|food_court)$\"]"
+                  3 -> "[\"amenity\"~\"^(hospital|clinic|pharmacy)$\"]"
+                  4 -> "[\"amenity\"=\"place_of_worship\"][\"religion\"=\"muslim\"]"
+                  5 -> "[\"amenity\"~\"^(atm|bank)$\"]"
+                  6 -> "[\"amenity\"=\"parking\"]"
+                  7 -> "[\"shop\"~\"^(supermarket|convenience|mall)$\"]"
+                  8 -> "[\"tourism\"~\"^(attraction|museum|viewpoint)$\"]"
+                  else -> "[\"amenity\"~\"^(fuel|restaurant|cafe|fast_food|hospital|clinic|pharmacy|place_of_worship|atm|bank|parking)$\"]"
+              }
+          
+              private fun refreshPoiLayer() {
+                  val features = JSONArray()
+                  for (poi in poiPoints) {
+                      features.put(JSONObject().put("type", "Feature")
+                          .put("properties", JSONObject().put("id", poi.id).put("name", poi.name))
+                          .put("geometry", JSONObject().put("type", "Point")
+                              .put("coordinates", JSONArray().put(poi.point.longitude).put(poi.point.latitude))))
+                  }
+                  currentStyle?.getSourceAs<GeoJsonSource>("nav-poi-source")?.setGeoJson(
+                      JSONObject().put("type", "FeatureCollection").put("features", features).toString()
+                  )
+              }
+          
+              private fun loadNearbyPois(showList: Boolean = false, force: Boolean = false) {
+                  val target = map?.cameraPosition?.target ?: return
+                  if (isFinishing || isDestroyed) return
+                  val now = SystemClock.elapsedRealtime()
+                  if (poiLoading && force) {
+                      poiRefreshPending = true
+                      return
+                  }
+                  if (poiLoading || (!force && poiLastAttempt != 0L && now - poiLastAttempt < 5000L)) {
+                      if (showList) Toast.makeText(this, "Tunggu sebentar sebelum carian POI seterusnya.", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val center = GeoPoint(target.latitude, target.longitude)
+                  val category = poiCategorySpinner.selectedItemPosition.coerceAtLeast(0)
+                  val requestId = ++poiRequestId
+                  poiLoading = true
+                  poiSearchButton.isEnabled = false
+                  poiLastAttempt = now
+                  poiStatusText.text = "Mencari ${poiCategories[category]} dalam 3 km dari tengah peta..."
+                  networkExecutor.execute {
+                      try {
+                          val selector = poiSelector(category)
+                          val around = "(around:3000,${center.latitude},${center.longitude})"
+                          val extra = if (category == 0)
+                              "nwr$around[\"shop\"~\"^(supermarket|convenience|mall)$\"];nwr$around[\"tourism\"~\"^(attraction|museum|viewpoint)$\"];" else ""
+                          // Include ways and relations; their centres are used as map/search points.
+                          val query = "[out:json][timeout:20];(nwr$around$selector;$extra);out center tags;"
+                          val connection = (URL("https://overpass-api.de/api/interpreter").openConnection() as HttpURLConnection).apply {
+                              requestMethod = "POST"
+                              doOutput = true
+                              useCaches = false
+                              connectTimeout = 15000
+                              readTimeout = 25000
+                              setRequestProperty("User-Agent", "QM-NAVIGASI/1.1 Android POI")
+                              setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                              setRequestProperty("Cache-Control", "no-cache")
+                          }
+                          val result = try {
+                              connection.outputStream.use { it.write(("data=" + URLEncoder.encode(query, "UTF-8")).toByteArray(Charsets.UTF_8)) }
+                              if (connection.responseCode != 200) throw IllegalStateException("Pelayan POI sibuk (${connection.responseCode}). Cuba lagi kemudian.")
+                              JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
+                          } finally { connection.disconnect() }
+                          if (result.has("remark")) throw IllegalStateException("Carian POI tidak lengkap. Cuba lagi kemudian.")
+                          val elements = result.getJSONArray("elements")
+                          val found = LinkedHashMap<String, Poi>()
+                          for (index in 0 until elements.length()) {
+                              val item = elements.getJSONObject(index)
+                              val position = item.optJSONObject("center") ?: item
+                              val lat = position.optDouble("lat", Double.NaN)
+                              val lon = position.optDouble("lon", Double.NaN)
+                              if (!lat.isFinite() || !lon.isFinite() || lat !in -90.0..90.0 || lon !in -180.0..180.0) continue
+                              val tags = item.optJSONObject("tags") ?: continue
+                              val kind = tags.optString("amenity").ifBlank { tags.optString("shop").ifBlank { tags.optString("tourism", "POI") } }
+                              val name = tags.optString("name:ms").ifBlank { tags.optString("name").ifBlank { tags.optString("brand").ifBlank { kind.replace('_', ' ') } } }
+                              val id = "${item.getString("type")}/${item.getLong("id")}"
+                              found[id] = Poi(id, name, kind.replace('_', ' '), GeoPoint(lat, lon))
+                          }
+                          val nearest = found.values.filter {
+                              distanceMeters(center.latitude, center.longitude, it.point.latitude, it.point.longitude) <= 3000.0
+                          }.sortedBy { distanceMeters(center.latitude, center.longitude, it.point.latitude, it.point.longitude) }.take(200)
+                          val dataTime = result.optJSONObject("osm3s")?.optString("timestamp_osm_base").orEmpty()
+                          runOnUiThread {
+                              if (requestId != poiRequestId || isFinishing || isDestroyed) return@runOnUiThread
+                              poiLoading = false
+                              poiSearchButton.isEnabled = true
+                              poiPoints = nearest
+                              poiSearchCenter = center
+                              refreshPoiLayer()
+                              val fetched = java.text.SimpleDateFormat("HH:mm", Locale("ms", "MY")).format(java.util.Date())
+                              poiStatusText.text = "${nearest.size} POI • ${poiCategories[category]} • Disemak $fetched" +
+                                  (if (dataTime.isNotBlank()) "\nData OSM: $dataTime" else "") +
+                                  "\nHijau = POI • Jarak garis lurus dari tengah peta • Maks. 200 terdekat"
+                              if (poiRefreshPending) {
+                                  poiRefreshPending = false
+                                  loadNearbyPois(force = true)
+                              } else if (showList) showPoiList(center)
+                          }
+                      } catch (error: Exception) {
+                          runOnUiThread {
+                              if (requestId != poiRequestId || isFinishing || isDestroyed) return@runOnUiThread
+                              poiLoading = false
+                              poiSearchButton.isEnabled = true
+                              poiStatusText.text = "POI gagal dikemas kini: ${error.localizedMessage ?: "Semak internet"}. Penanda terdahulu dikekalkan."
+                              if (poiRefreshPending) {
+                                  poiRefreshPending = false
+                                  loadNearbyPois(force = true)
+                              }
+                          }
+                      }
+                  }
+              }
+          
+              private fun showPoiList(center: GeoPoint) {
+                  if (poiPoints.isEmpty()) {
+                      AlertDialog.Builder(this).setTitle("POI berdekatan").setMessage("Tiada POI kategori ini ditemui dalam 3 km. Gerakkan peta atau pilih kategori lain.")
+                          .setPositiveButton("OK", null).show()
+                      return
+                  }
+                  val snapshot = poiPoints.toList()
+                  val labels = snapshot.map { "${it.name}\n${it.category} • ${formatDistance(distanceMeters(center.latitude, center.longitude, it.point.latitude, it.point.longitude))}" }.toTypedArray()
+                  AlertDialog.Builder(this).setTitle("POI — jarak garis lurus")
+                      .setItems(labels) { _, index -> showPoiDetails(snapshot[index]) }
+                      .setNegativeButton("Tutup", null).show()
+              }
+          
+              private fun showPoiDetails(poi: Poi) {
+                  AlertDialog.Builder(this).setTitle(poi.name)
+                      .setMessage("${poi.category}\n${poi.point.latitude}, ${poi.point.longitude}\nSumber: © OpenStreetMap contributors. Semak akses masuk dan waktu operasi di lokasi.")
+                      .setPositiveButton("NAVIGASI") { _, _ ->
+                          destinationInput.setText(poi.name)
+                          findRoute(poi.point)
+                      }
+                      .setNeutralButton("LIHAT PETA") { _, _ ->
+                          followGps = false
+                          map?.animateCamera(CameraUpdateFactory.newLatLngZoom(LatLng(poi.point.latitude, poi.point.longitude), 17.0))
+                      }
+                      .setNegativeButton("Tutup", null).show()
+              }
+          
+              private fun refreshOnlineMap() {
+                  val readyMap = map ?: return
+                  if (mapRefreshing || isFinishing || isDestroyed) return
+                  mapRefreshing = true
+                  mapRefreshButton.isEnabled = false
+                  poiStatusText.text = "Menyemak semula cache peta dengan pelayan..."
+                  val timeout = Runnable {
+                      if (!isFinishing && !isDestroyed && mapRefreshing) {
+                          mapRefreshing = false
+                          mapRefreshButton.isEnabled = true
+                          poiStatusText.text = "Peta belum selesai dimuatkan. Semak internet dan cuba KEMAS KINI semula."
+                      }
+                  }
+                  mapRefreshButton.postDelayed(timeout, 30000L)
+                  OfflineManager.getInstance(this).invalidateAmbientCache(object : OfflineManager.FileSourceCallback {
+                      override fun onSuccess() {
+                          if (isFinishing || isDestroyed) return
+                          currentStyle = null
+                          readyMap.setStyle(Style.Builder().fromUri(MAP_STYLE_URL)) { style ->
+                              if (isFinishing || isDestroyed) return@setStyle
+                              currentStyle = style
+                              installMapLayers(style)
+                              mapRefreshing = false
+                              mapRefreshButton.isEnabled = true
+                              mapRefreshButton.removeCallbacks(timeout)
+                              poiStatusText.text = "Peta dimuat semula mengikut versi pembekal. Data POI sedang disemak."
+                              loadNearbyPois(force = true)
+                          }
+                      }
+                      override fun onError(message: String) {
+                          if (isFinishing || isDestroyed) return
+                          mapRefreshing = false
+                          mapRefreshButton.isEnabled = true
+                          mapRefreshButton.removeCallbacks(timeout)
+                          poiStatusText.text = "Peta gagal disemak: $message. Cuba lagi apabila internet tersedia."
+                      }
+                  })
+              }
+          
+          '''
+          replace('    private fun makeButton(label: String)', methods + '    private fun makeButton(label: String)')
+          replace('    override fun onDestroy() {', '    override fun onDestroy() {\n        poiRequestId += 1')
+          path.write_text(source)
+          gradle = Path('app/build.gradle.kts')
+          config = gradle.read_text().replace('versionCode = 1', 'versionCode = 2').replace('versionName = "1.0.0"', 'versionName = "1.1.0"')
+          gradle.write_text(config)
+          print('POI search, direct routing and cache-revalidated online map refresh applied.')
+          PY
+
+      - name: Add Nyamuk Menggigit creator and logo
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          
+          path = Path('app/src/main/java/com/nav3dmalaysia/MainActivity.kt')
+          source = path.read_text()
+          old = '        root.addView(header, LinearLayout.LayoutParams(-1, -2))'
+          assert source.count(old) == 1, 'Creator header anchor changed'
+          source = source.replace(old, '''        val brandHeader = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                      setBackgroundColor(Color.rgb(15, 23, 42))
+                  }
+                  val creatorLogo = android.widget.ImageView(this).apply {
+                      setImageResource(com.nav3dmalaysia.R.drawable.ic_nyamuk_menggigit)
+                      contentDescription = "Logo Nyamuk Menggigit"
+                      scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                  }
+                  brandHeader.addView(creatorLogo, LinearLayout.LayoutParams(dp(52), dp(52)))
+                  val brandText = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(10), 0, 0, 0)
+                  }
+                  header.setPadding(0, 0, 0, dp(3))
+                  brandText.addView(header, LinearLayout.LayoutParams(-1, -2))
+                  val creatorText = TextView(this).apply {
+                      text = "Dicipta oleh Nyamuk Menggigit"
+                      textSize = 12f
+                      setTextColor(Color.rgb(253, 224, 71))
+                  }
+                  brandText.addView(creatorText, LinearLayout.LayoutParams(-1, -2))
+                  brandHeader.addView(brandText, LinearLayout.LayoutParams(0, -2, 1f))
+                  root.addView(brandHeader, LinearLayout.LayoutParams(-1, -2))''', 1)
+          path.write_text(source)
+          drawable = Path('app/src/main/res/drawable/ic_nyamuk_menggigit.xml')
+          drawable.parent.mkdir(parents=True, exist_ok=True)
+          drawable.write_text('''<?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="64dp" android:height="64dp"
+              android:viewportWidth="64" android:viewportHeight="64">
+              <path android:fillColor="#1E293B" android:pathData="M32,1 A31,31 0,1 1,32 63 A31,31 0,1 1,32 1" />
+              <!-- Two translucent blue wings, a dark head, and a red striped abdomen. -->
+              <path android:fillColor="#7DD3FC" android:strokeColor="#E0F2FE" android:strokeWidth="1.5"
+                  android:pathData="M31,27 C18,24 8,11 15,8 C22,5 29,16 31,27 Z M33,27 C35,14 44,6 49,11 C55,18 43,26 33,27 Z" />
+              <path android:fillColor="#00000000" android:strokeColor="#CBD5E1" android:strokeWidth="2" android:strokeLineCap="round" android:strokeLineJoin="round"
+                  android:pathData="M29,29 L16,26 L7,32 M30,34 L17,36 L10,46 M34,30 L47,27 L57,32 M36,35 L47,39 L53,50 M32,39 L25,47 L24,56 M37,40 L40,49 L38,57" />
+              <path android:fillColor="#F43F5E" android:strokeColor="#FECDD3" android:strokeWidth="1.4"
+                  android:pathData="M31,28 C27,33 30,44 36,49 C41,43 39,33 34,28 Z" />
+              <path android:fillColor="#00000000" android:strokeColor="#881337" android:strokeWidth="2"
+                  android:pathData="M29,35 L38,33 M31,41 L39,39 M34,46 L38,44" />
+              <path android:fillColor="#F8FAFC" android:pathData="M31,18 A5,5 0,1 1,31 28 A5,5 0,1 1,31 18" />
+              <path android:fillColor="#0F172A" android:pathData="M29,20 A1.3,1.3 0,1 1,29 22.6 A1.3,1.3 0,1 1,29 20" />
+              <path android:fillColor="#00000000" android:strokeColor="#F8FAFC" android:strokeWidth="1.6" android:strokeLineCap="round"
+                  android:pathData="M28,19 L24,13 M34,19 L36,12 M27,25 L13,43" />
+              <!-- Bite/drop at the tip of the proboscis. -->
+              <path android:fillColor="#FB7185" android:pathData="M13,41 C11,44 9,46 9,48 A4,4 0,0 0,17 48 C17,46 15,44 13,41 Z" />
+          </vector>
+          ''')
+          gradle = Path('app/build.gradle.kts')
+          config = gradle.read_text()
+          assert 'versionCode = 2' in config and 'versionName = "1.1.0"' in config
+          gradle.write_text(config.replace('versionCode = 2', 'versionCode = 3').replace('versionName = "1.1.0"', 'versionName = "1.1.1"'))
+          print('Creator credit and Nyamuk Menggigit logo added to the main header.')
+          PY
+
+      - name: Upgrade POI search sound traffic and offline modes
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          
+          path = Path('app/src/main/java/com/nav3dmalaysia/MainActivity.kt')
+          source = path.read_text()
+          
+          def patch(old, new):
+              global source
+              if source.count(old) != 1:
+                  raise SystemExit(f'Advanced patch anchor changed: {old[:100]!r} ({source.count(old)} matches)')
+              source = source.replace(old, new, 1)
+          
+          patch('searchButton.setOnClickListener { findRoute() }', 'searchButton.setOnClickListener { scheduleDestinationSearch(immediate = true) }')
+          patch('                findRoute()\n                true', '                scheduleDestinationSearch(immediate = true)\n                true')
+          patch('        root.addView(searchRow, LinearLayout.LayoutParams(-1, -2))', '        root.addView(searchRow, LinearLayout.LayoutParams(-1, -2))\n        setupDestinationSearch(root)')
+          patch('        root.addView(voiceRow, LinearLayout.LayoutParams(-1, -2))', '''        val trafficButton = makeButton("TRAFIK")
+                  trafficButton.setOnClickListener { showTrafficSettings() }
+                  voiceRow.addView(trafficButton, LinearLayout.LayoutParams(dp(72), dp(40)))
+                  modeButton = makeButton(if (offlineMode) "OFFLINE" else "ONLINE")
+                  modeButton.setOnClickListener { showMapModes() }
+                  voiceRow.addView(modeButton, LinearLayout.LayoutParams(dp(76), dp(40)))
+                  root.addView(voiceRow, LinearLayout.LayoutParams(-1, -2))''')
+          patch('        poiSearchButton = makeButton("CARI POI")\n        poiSearchButton.setOnClickListener { loadNearbyPois(showList = true) }', '''        poiSearchButton = makeButton("ALL POI")
+                  poiSearchButton.setOnClickListener {
+                      showPoiArea()
+                      if (poiCategorySpinner.selectedItemPosition == 0) loadNearbyPois(force = true)
+                      else poiCategorySpinner.setSelection(0)
+                  }
+                  poiCategorySpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                      override fun onItemSelected(parent: android.widget.AdapterView<*>?, view: android.view.View?, position: Int, id: Long) {
+                          if (map != null) { tapFeedback(); loadNearbyPois(force = true) }
+                      }
+                      override fun onNothingSelected(parent: android.widget.AdapterView<*>?) {}
+                  }''')
+          patch('        root.addView(poiStatusText, LinearLayout.LayoutParams(-1, -2))', '''        poiStatusText.setOnClickListener { tapFeedback(); poiSearchCenter?.let { showPoiList(it) } }
+                  root.addView(poiStatusText, LinearLayout.LayoutParams(-1, -2))''')
+          patch('            val nearest = poiPoints.minByOrNull {', '            val nearest = visiblePois().minByOrNull {') if '            val nearest = poiPoints.minByOrNull {' in source else patch('                    val nearest = poiPoints.minByOrNull {', '                    val nearest = visiblePois().minByOrNull {')
+          patch('        bottomPanel.addView(nextTurnText, LinearLayout.LayoutParams(-1, -2))', '        nextTurnText.visibility = android.view.View.GONE')
+          patch('        bottomPanel.addView(routeLegendText, LinearLayout.LayoutParams(-1, -2))', '        routeLegendText.visibility = android.view.View.GONE')
+          patch('        bottomPanel.addView(instructionsScroll, LinearLayout.LayoutParams(-1, dp(104)))', '''        instructionsScroll.visibility = android.view.View.GONE
+                  trafficStatus = TextView(this).apply {
+                      text = if (offlineMode) "OFFLINE • Trafik langsung tidak tersedia" else "Trafik langsung: belum disambung (tekan TRAFIK)"
+                      textSize = 11f
+                      setTextColor(Color.rgb(71, 85, 105))
+                  }
+                  bottomPanel.addView(trafficStatus, LinearLayout.LayoutParams(-1, -2))''')
+          patch('    private fun makeButton(label: String): Button = Button(this).apply {', '''    private fun makeButton(label: String): Button = object : androidx.appcompat.widget.AppCompatButton(this) {
+                  override fun performClick(): Boolean {
+                      val enabled = isEnabled
+                      val handled = super.performClick()
+                      if (enabled && handled) tapFeedback()
+                      return handled
+                  }
+              }.apply {''')
+          patch('    private fun findRoute(poiTarget: GeoPoint? = null) {', '''    private fun findRoute(poiTarget: GeoPoint? = null) {
+                  if (offlineMode) { statusText.text = "Laluan baharu memerlukan Online. Peta dan POI tersimpan masih boleh digunakan."; return }
+                  val routeGeneration = ++routeRequestId''')
+          patch('                runOnUiThread {\n                    destination = target', '''                runOnUiThread {
+                              if (routeGeneration != routeRequestId || offlineMode || isFinishing || isDestroyed) return@runOnUiThread
+                              destination = target''')
+          patch('                    statusText.text = "Tidak dapat mencari laluan:', '                    if (routeGeneration != routeRequestId || offlineMode || isFinishing || isDestroyed) return@runOnUiThread\n                    statusText.text = "Tidak dapat mencari laluan:')
+          patch('            updateNavigationProgress(location)\n            checkNearbySpeedCameras(location)', '            updateNavigationProgress(location)\n            checkNearbySpeedCameras(location)\n            checkLiveTraffic(location)')
+          patch('        navigationStarted = true\n        followGps = true', '        navigationStarted = true\n        trafficLastCheck = 0L\n        followGps = true')
+          patch('        speakNavigation("Navigasi bermula. $instruction", TextToSpeech.QUEUE_FLUSH, "navigation_start")', '        speakNavigation("Navigasi bermula. $instruction", TextToSpeech.QUEUE_FLUSH, "navigation_start")\n        currentLocation?.let { checkLiveTraffic(it) }')
+          patch('    private fun loadSpeedCameras(routePoints: List<GeoPoint>, distanceMeters: Double) {', '    private fun loadSpeedCameras(routePoints: List<GeoPoint>, distanceMeters: Double) {\n        if (offlineMode) return')
+          camera_start = source.index('    private fun loadSpeedCameras(')
+          camera_end = source.index('    private fun refreshCameraLayer(', camera_start)
+          camera_method = source[camera_start:camera_end]
+          camera_method = camera_method.replace('        networkExecutor.execute {', '        val cameraRoute = currentRoute\n        networkExecutor.execute {\n            if (offlineMode) return@execute', 1)
+          camera_method = camera_method.replace('                runOnUiThread {', '                runOnUiThread {\n                    if (offlineMode || currentRoute !== cameraRoute || isFinishing || isDestroyed) return@runOnUiThread')
+          source = source[:camera_start] + camera_method + source[camera_end:]
+          patch('    private fun geocodeDestination(query: String): GeoPoint {', '    private fun geocodeDestination(query: String): GeoPoint {\n        if (offlineMode) throw IllegalStateException("Mod Offline")')
+          patch('    private fun requestRoute(origin: GeoPoint, target: GeoPoint): RouteResult {', '    private fun requestRoute(origin: GeoPoint, target: GeoPoint): RouteResult {\n        if (offlineMode) throw IllegalStateException("Mod Offline")')
+          patch('    private fun refreshOnlineMap() {', '    private fun refreshOnlineMap() {\n        if (offlineMode) { statusText.text = "Pilih Online untuk kemas kini peta dan POI."; return }')
+          patch('    private fun loadNearbyPois(showList: Boolean = false, force: Boolean = false) {', '''    private fun loadNearbyPois(showList: Boolean = false, force: Boolean = false) {
+                  if (offlineMode) {
+                      refreshPoiLayer()
+                      poiStatusText.text = "${visiblePois().size} POI tersimpan • Offline • Ketik untuk senarai"
+                      if (showList) poiSearchCenter?.let { showPoiList(it) }
+                      return
+                  }''')
+          start = source.index('                val extra = if (category == 0)')
+          end = source.index('                val connection = ', start)
+          source = source[:start] + '''                val query = if (category == 0) NavigationRules.allPoiQuery(center.latitude, center.longitude)
+                              else "[out:json][timeout:25];nwr$around$selector;out center tags;"
+          ''' + source[end:]
+          patch('readTimeout = 25000\n                    setRequestProperty("User-Agent", "QM-NAVIGASI/1.1 Android POI")', 'readTimeout = 35000\n                    setRequestProperty("User-Agent", "QM-NAVIGASI/2.0 Android POI")')
+          patch('                    val kind = tags.optString("amenity").ifBlank { tags.optString("shop").ifBlank { tags.optString("tourism", "POI") } }', '''                    val kind = NavigationRules.poiKeys.firstNotNullOfOrNull { key -> tags.optString(key).takeIf { it.isNotBlank() } } ?: "POI"''')
+          patch('}.take(200)', '}')
+          patch('• Maks. 200 terdekat', '• Semua hasil diterima • Ketik untuk senarai')
+          patch('    private data class Poi(val id: String, val name: String, val category: String, val point: GeoPoint)', '    private data class Poi(val id: String, val name: String, val category: String, val point: GeoPoint, val religion: String = "")')
+          patch("found[id] = Poi(id, name, kind.replace('_', ' '), GeoPoint(lat, lon))", 'found[id] = Poi(id, name, kind.replace(\'_\', \' \'), GeoPoint(lat, lon), tags.optString("religion"))')
+          patch('        for (poi in poiPoints) {', '        for (poi in visiblePois()) {')
+          patch('        val snapshot = poiPoints.toList()', '        val snapshot = visiblePois()')
+          patch('        if (poiPoints.isEmpty()) {', '        if (visiblePois().isEmpty()) {')
+          patch('                    if (requestId != poiRequestId || isFinishing || isDestroyed) return@runOnUiThread\n                    poiLoading = false', '                    if (requestId != poiRequestId || offlineMode || isFinishing || isDestroyed) return@runOnUiThread\n                    poiLoading = false') if source.count('                    if (requestId != poiRequestId || isFinishing || isDestroyed) return@runOnUiThread\n                    poiLoading = false') == 1 else None
+          # Both the success and failure callbacks must reject requests made before an Offline switch.
+          source = source.replace('if (requestId != poiRequestId || isFinishing || isDestroyed)', 'if (requestId != poiRequestId || offlineMode || isFinishing || isDestroyed)')
+          patch('                destinationInput.setText(poi.name)', '                suppressSearch = true\n                destinationInput.setText(poi.name)\n                suppressSearch = false')
+          patch('            MapLibre.getInstance(this)', '''            MapLibre.getInstance(this)
+                      offlineMode = getPreferences(MODE_PRIVATE).getBoolean("offline_mode", false)
+                      MapLibre.setConnected(!offlineMode)''')
+          patch('                        loadNearbyPois()\n                    } catch (error: Throwable)', '''                        if (offlineMode) restoreOfflineSelection() else loadNearbyPois()
+                              } catch (error: Throwable)''')
+          patch('                readyMap.addOnCameraIdleListener {', '''                readyMap.addOnCameraIdleListener {
+                              val viewed = readyMap.cameraPosition.target
+                              if (offlineMode && viewed != null && offlineBounds?.contains(viewed) == false) {
+                                  statusText.text = "Di luar kawasan offline yang dimuat turun. Pilih Online atau kawasan tersimpan lain."
+                              }''')
+          patch('    override fun onResume() {\n        super.onResume()', '    override fun onResume() {\n        super.onResume()\n        visibleActivity = true\n        uiHandler.post(trafficTimer)')
+          patch('    override fun onPause() {', '    override fun onPause() {\n        visibleActivity = false\n        uiHandler.removeCallbacks(trafficTimer)\n        trafficDialog?.dismiss()')
+          patch('    override fun onDestroy() {\n        poiRequestId += 1', '''    override fun onDestroy() {
+                  poiRequestId += 1
+                  routeRequestId += 1
+                  searchGeneration += 1
+                  uiHandler.removeCallbacksAndMessages(null)
+                  searchExecutor.shutdownNow()
+                  trafficDialog?.dismiss()
+                  tapTone?.release()
+                  activeDownload?.setDownloadState(org.maplibre.android.offline.OfflineRegion.STATE_INACTIVE)
+                  activeDownload?.setObserver(null)
+                  MapLibre.setConnected(true)''')
+          
+          methods = '    private data class SearchPlace(val name: String, val address: String, val point: GeoPoint)\n    private lateinit var searchResults: android.widget.ListView\n    private lateinit var searchHint: TextView\n    private lateinit var trafficStatus: TextView\n    private lateinit var modeButton: Button\n    private val uiHandler = android.os.Handler(Looper.getMainLooper())\n    private val searchExecutor = Executors.newSingleThreadExecutor()\n    private var searchTask: Runnable? = null\n    private var searchGeneration = 0\n    private var searchInFlight = false\n    private var searchPending = false\n    private var suppressSearch = false\n    private var searchLastSent = 0L\n    private var searchPlaces: List<SearchPlace> = emptyList()\n    private var tapTone: android.media.ToneGenerator? = null\n    @Volatile private var offlineMode = false\n    @Volatile private var trafficApiKey = ""\n    private var trafficBusy = false\n    private var trafficLastCheck = 0L\n    private var trafficLastAlert = 0L\n    private var trafficDialog: AlertDialog? = null\n    @Volatile private var routeRequestId = 0\n    private var visibleActivity = false\n    private val trafficTimer = object : Runnable {\n        override fun run() {\n            if (!visibleActivity || isFinishing || isDestroyed) return\n            currentLocation?.let { checkLiveTraffic(it) }\n            uiHandler.postDelayed(this, 90000L)\n        }\n    }\n    private var activeDownload: org.maplibre.android.offline.OfflineRegion? = null\n\n    private fun tapFeedback() {\n        try {\n            if (tapTone == null) tapTone = android.media.ToneGenerator(android.media.AudioManager.STREAM_SYSTEM, 45)\n            tapTone?.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 65)\n        } catch (_: RuntimeException) { /* Sound follows device volume and audio availability. */ }\n    }\n\n    private fun showPoiArea() {\n        val center = map?.cameraPosition?.target ?: return\n        val lat = 3000.0 / 111320.0\n        val lon = lat / kotlin.math.cos(Math.toRadians(center.latitude)).coerceAtLeast(0.1)\n        val bounds = org.maplibre.android.geometry.LatLngBounds.from(center.latitude + lat, center.longitude + lon, center.latitude - lat, center.longitude - lon)\n        followGps = false\n        map?.animateCamera(CameraUpdateFactory.newLatLngBounds(bounds, dp(20)))\n    }\n\n    private fun setupDestinationSearch(root: LinearLayout) {\n        searchHint = TextView(this).apply {\n            textSize = 11f\n            setTextColor(Color.rgb(51, 65, 85))\n            setPadding(dp(12), 0, dp(12), 0)\n            visibility = android.view.View.GONE\n        }\n        searchResults = android.widget.ListView(this).apply {\n            setBackgroundColor(Color.WHITE)\n            visibility = android.view.View.GONE\n        }\n        root.addView(searchHint, LinearLayout.LayoutParams(-1, -2))\n        root.addView(searchResults, LinearLayout.LayoutParams(-1, dp(160)))\n        searchResults.setOnItemClickListener { _, _, position, _ ->\n            val place = searchPlaces.getOrNull(position) ?: return@setOnItemClickListener\n            tapFeedback()\n            selectSearchPlace(place)\n        }\n        destinationInput.hint = "Taip tempat (cth. Kuala...)"\n        destinationInput.addTextChangedListener(object : android.text.TextWatcher {\n            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}\n            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {\n                if (suppressSearch) return\n                scheduleDestinationSearch()\n            }\n            override fun afterTextChanged(s: android.text.Editable?) {}\n        })\n    }\n\n    private fun scheduleDestinationSearch(immediate: Boolean = false) {\n        searchGeneration += 1\n        searchTask?.let { uiHandler.removeCallbacks(it) }\n        searchPlaces = emptyList()\n        searchResults.visibility = android.view.View.GONE\n        val query = destinationInput.text.toString().trim()\n        if (query.length < 2) {\n            searchHint.text = "Taip sekurang-kurangnya 2 huruf."\n            searchHint.visibility = if (immediate) android.view.View.VISIBLE else android.view.View.GONE\n            return\n        }\n        searchHint.text = "Mencari padanan untuk ‘$query’..."\n        searchHint.visibility = android.view.View.VISIBLE\n        val task = Runnable { runDestinationSearch() }\n        searchTask = task\n        val cooldown = (1200L - (SystemClock.elapsedRealtime() - searchLastSent)).coerceAtLeast(0L)\n        uiHandler.postDelayed(task, if (immediate) cooldown else maxOf(700L, cooldown))\n    }\n\n    private fun runDestinationSearch() {\n        if (isFinishing || isDestroyed) return\n        if (searchInFlight) { searchPending = true; return }\n        val query = destinationInput.text.toString().trim()\n        if (query.length < 2) return\n        val generation = searchGeneration\n        val local = poiPoints.map { SearchPlace(it.name, it.category, it.point) }\n            .filter { NavigationRules.searchRank(it.name, it.address, query) < 3 }\n        if (offlineMode) { publishSearchResults(query, local); return }\n        searchInFlight = true\n        searchLastSent = SystemClock.elapsedRealtime()\n        searchExecutor.execute {\n            var error: String? = null\n            val remote = try {\n                val json = fetchJson("https://photon.komoot.io/api/?q=${URLEncoder.encode(query, "UTF-8")}&limit=50&countrycode=MY")\n                val features = json.getJSONArray("features")\n                (0 until features.length()).mapNotNull { index ->\n                    val item = features.getJSONObject(index)\n                    val props = item.getJSONObject("properties")\n                    if (!props.optString("countrycode").equals("MY", ignoreCase = true)) return@mapNotNull null\n                    val coords = item.getJSONObject("geometry").getJSONArray("coordinates")\n                    val address = listOf("street", "district", "city", "county", "state", "postcode")\n                        .map { props.optString(it) }.filter { it.isNotBlank() }.distinct().joinToString(", ")\n                    val name = props.optString("name").ifBlank { props.optString("street") }\n                    if (name.isBlank()) null else SearchPlace(name, address, GeoPoint(coords.getDouble(1), coords.getDouble(0)))\n                }.filter { NavigationRules.searchRank(it.name, it.address, query) < 3 }\n            } catch (_: Exception) { error = "Carian online tidak tersedia. Semak internet dan tekan CARI untuk cuba lagi."; emptyList() }\n            runOnUiThread {\n                searchInFlight = false\n                if (isFinishing || isDestroyed) return@runOnUiThread\n                if (generation == searchGeneration && !offlineMode) {\n                    publishSearchResults(query, local + remote)\n                    if (error != null) searchHint.text = if (searchPlaces.isEmpty()) error else "$error Menunjukkan POI tersimpan."\n                }\n                if (searchPending) { searchPending = false; scheduleDestinationSearch() }\n            }\n        }\n    }\n\n    private fun publishSearchResults(query: String, places: List<SearchPlace>) {\n        searchPlaces = places.distinctBy { "${it.name.lowercase(Locale.ROOT)}:${it.point.latitude}:${it.point.longitude}" }\n            .sortedWith(compareBy<SearchPlace> { NavigationRules.searchRank(it.name, it.address, query) }.thenBy { it.name })\n        searchResults.adapter = object : ArrayAdapter<SearchPlace>(this, android.R.layout.simple_list_item_2, android.R.id.text1, searchPlaces) {\n                override fun getView(position: Int, convertView: android.view.View?, parent: android.view.ViewGroup): android.view.View {\n                    val row = super.getView(position, convertView, parent)\n                    val item = getItem(position)!!\n                    row.findViewById<TextView>(android.R.id.text1).apply { text = item.name; setTextColor(Color.rgb(15, 23, 42)); textSize = 14f }\n                    row.findViewById<TextView>(android.R.id.text2).apply { text = item.address; setTextColor(Color.rgb(71, 85, 105)); textSize = 11f }\n                    return row\n                }\n            }\n        searchResults.visibility = if (searchPlaces.isEmpty()) android.view.View.GONE else android.view.View.VISIBLE\n        searchHint.visibility = android.view.View.VISIBLE\n        searchHint.text = if (searchPlaces.isEmpty()) "Tiada padanan. Cuba tambah nama negeri atau bandar." else\n            "${searchPlaces.size} padanan • Pilih destinasi • ${if (offlineMode) "POI tersimpan" else "Photon / © OpenStreetMap; maksimum 50 padanan online"}"\n    }\n\n    private fun selectSearchPlace(place: SearchPlace) {\n        searchGeneration += 1\n        searchTask?.let { uiHandler.removeCallbacks(it) }\n        suppressSearch = true\n        destinationInput.setText(place.name)\n        suppressSearch = false\n        searchResults.visibility = android.view.View.GONE\n        searchHint.visibility = android.view.View.GONE\n        (getSystemService(INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager)\n            .hideSoftInputFromWindow(destinationInput.windowToken, 0)\n        destinationInput.clearFocus()\n        if (offlineMode) {\n            followGps = false\n            map?.animateCamera(CameraUpdateFactory.newLatLngZoom(LatLng(place.point.latitude, place.point.longitude), 16.0))\n            statusText.text = "Lokasi tersimpan dipaparkan. Laluan baharu memerlukan mod Online."\n        } else findRoute(place.point)\n    }\n\n    private fun fetchJson(url: String): JSONObject {\n        if (offlineMode) throw IllegalStateException("Mod Offline")\n        val connection = (URL(url).openConnection() as HttpURLConnection).apply {\n            connectTimeout = 12000; readTimeout = 20000\n            setRequestProperty("User-Agent", "QM-NAVIGASI/2.0 Android")\n            setRequestProperty("Accept", "application/json")\n        }\n        return try {\n            if (connection.responseCode != 200) throw IllegalStateException("HTTP ${connection.responseCode}")\n            JSONObject(connection.inputStream.bufferedReader().use { it.readText() })\n        } finally { connection.disconnect() }\n    }\n\n    private fun showTrafficSettings() {\n        val input = EditText(this).apply {\n            hint = "Kunci API TomTom (Traffic + Routing)"\n            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD\n            setText(trafficApiKey)\n        }\n        AlertDialog.Builder(this).setTitle("Trafik langsung")\n            .setMessage("Masukkan kunci API TomTom anda untuk amaran aliran perlahan di hadapan dan pilihan laluan alternatif. Lokasi di sepanjang laluan dihantar ke TomTom semasa navigasi Online. Kunci digunakan untuk sesi ini sahaja. Tiada data trafik dalam mod Offline.")\n            .setView(input).setPositiveButton("AKTIFKAN") { _, _ ->\n                tapFeedback(); trafficApiKey = input.text.toString().trim(); trafficLastCheck = 0L\n                trafficStatus.text = if (trafficApiKey.isBlank()) "Trafik langsung: belum disambung" else "Trafik © TomTom: sedia; semakan semasa navigasi Online"\n                currentLocation?.let { checkLiveTraffic(it) }\n            }.setNeutralButton("MATIKAN") { _, _ ->\n                tapFeedback(); trafficApiKey = ""; trafficDialog?.dismiss()\n                trafficStatus.text = "Trafik langsung: dimatikan"\n            }.setNegativeButton("Tutup", null).show()\n    }\n\n    private fun routeAhead(route: RouteResult, location: Location): List<GeoPoint> {\n        val points = route.coordinates\n        val nearest = points.indices.minByOrNull { distanceMeters(location.latitude, location.longitude, points[it].latitude, points[it].longitude) } ?: return emptyList()\n        if (distanceMeters(location.latitude, location.longitude, points[nearest].latitude, points[nearest].longitude) > 150.0) return emptyList()\n        var traveled = 0.0\n        val samples = mutableListOf<GeoPoint>()\n        var next = 400.0\n        for (i in nearest + 1 until points.size) {\n            val a = points[i - 1]\n            val b = points[i]\n            val length = distanceMeters(a.latitude, a.longitude, b.latitude, b.longitude)\n            while (length > 0.0 && traveled + length >= next && next <= 1800.0) {\n                val fraction = ((next - traveled) / length).coerceIn(0.0, 1.0)\n                samples.add(GeoPoint(a.latitude + (b.latitude - a.latitude) * fraction, a.longitude + (b.longitude - a.longitude) * fraction))\n                next += 700.0\n            }\n            traveled += length\n            if (next > 1800.0) break\n        }\n        return samples\n    }\n\n    private fun distanceToPolyline(point: GeoPoint, line: List<GeoPoint>): Double {\n        if (line.isEmpty()) return Double.POSITIVE_INFINITY\n        if (line.size == 1) return distanceMeters(point.latitude, point.longitude, line[0].latitude, line[0].longitude)\n        val xScale = 111320.0 * kotlin.math.cos(Math.toRadians(point.latitude))\n        var closest = Double.POSITIVE_INFINITY\n        for (i in 1 until line.size) {\n            val ax = (line[i - 1].longitude - point.longitude) * xScale\n            val ay = (line[i - 1].latitude - point.latitude) * 111320.0\n            val bx = (line[i].longitude - point.longitude) * xScale\n            val by = (line[i].latitude - point.latitude) * 111320.0\n            val dx = bx - ax; val dy = by - ay\n            val lengthSquared = dx * dx + dy * dy\n            val t = if (lengthSquared == 0.0) 0.0 else (-(ax * dx + ay * dy) / lengthSquared).coerceIn(0.0, 1.0)\n            closest = minOf(closest, kotlin.math.sqrt((ax + t * dx) * (ax + t * dx) + (ay + t * dy) * (ay + t * dy)))\n        }\n        return closest\n    }\n\n    private fun checkLiveTraffic(location: Location) {\n        if (offlineMode || !visibleActivity || !navigationStarted || trafficApiKey.isBlank() || trafficBusy || trafficDialog?.isShowing == true) return\n        val now = SystemClock.elapsedRealtime()\n        if (trafficLastCheck != 0L && now - trafficLastCheck < 90000L) return\n        val route = currentRoute ?: return\n        val samples = routeAhead(route, location)\n        if (samples.isEmpty()) return\n        val key = trafficApiKey\n        trafficLastCheck = now; trafficBusy = true\n        trafficStatus.text = "Menyemak trafik © TomTom di sepanjang laluan..."\n        networkExecutor.execute {\n            var slow = false\n            var covered = false\n            var failed = false\n            for (sample in samples) {\n                if (offlineMode || key != trafficApiKey) break\n                try {\n                    val data = fetchJson("https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/16/json?point=${sample.latitude},${sample.longitude}&unit=KMPH&key=${URLEncoder.encode(key, "UTF-8")}").getJSONObject("flowSegmentData")\n                    val coordinates = data.optJSONObject("coordinates")?.optJSONArray("coordinate") ?: continue\n                    val flowLine = (0 until coordinates.length()).map {\n                        val point = coordinates.getJSONObject(it)\n                        GeoPoint(point.getDouble("latitude"), point.getDouble("longitude"))\n                    }\n                    val onCorridor = distanceToPolyline(sample, flowLine) <= 100.0\n                    if (!onCorridor || data.optDouble("confidence") < 0.7) continue\n                    covered = true\n                    if (NavigationRules.isCongested(data.optDouble("confidence"), data.optDouble("currentSpeed"), data.optDouble("freeFlowSpeed"),\n                        data.optDouble("currentTravelTime") - data.optDouble("freeFlowTravelTime"), data.optBoolean("roadClosure"))) { slow = true; break }\n                } catch (_: Exception) { failed = true }\n            }\n            runOnUiThread {\n                trafficBusy = false\n                if (isFinishing || isDestroyed || offlineMode || currentRoute !== route || key != trafficApiKey || !visibleActivity) return@runOnUiThread\n                trafficStatus.text = when {\n                    slow -> "Trafik © TomTom: aliran perlahan / penutupan berhampiran laluan di hadapan"\n                    failed -> "Trafik tidak tersedia sepenuhnya; semak internet, kunci atau kuota API."\n                    covered -> "Trafik © TomTom: tiada aliran perlahan pada segmen yang disemak"\n                    else -> "Trafik: tiada liputan yang dapat dipadankan dengan laluan ini"\n                }\n                if (slow && (trafficLastAlert == 0L || SystemClock.elapsedRealtime() - trafficLastAlert > 300000L)) {\n                    trafficLastAlert = SystemClock.elapsedRealtime()\n                    val message = if (voiceLanguage == "english") "Traffic data indicates slow traffic or a closure near the route ahead. Would you like to check an alternative route?" else\n                        "Data trafik menunjukkan aliran perlahan atau penutupan berhampiran laluan di hadapan. Mahu semak jalan alternatif?"\n                    tts?.speak(message, TextToSpeech.QUEUE_ADD, null, "traffic_alert")\n                    trafficDialog = AlertDialog.Builder(this).setTitle("Trafik di hadapan")\n                        .setMessage("Data menunjukkan kemungkinan kesesakan berhampiran laluan. Mahu cari jalan alternatif dengan mengambil kira trafik?")\n                        .setPositiveButton("YA / YES") { _, _ -> tapFeedback(); requestAlternative(route) }\n                        .setNegativeButton("TIDAK / NO") { _, _ -> tapFeedback() }.show()\n                }\n            }\n        }\n    }\n\n    private fun requestAlternative(original: RouteResult) {\n        val location = currentLocation ?: return\n        val target = destination ?: return\n        val key = trafficApiKey\n        if (offlineMode || key.isBlank()) return\n        val english = voiceLanguage == "english"\n        trafficStatus.text = "Mencari laluan alternatif dengan trafik © TomTom..."\n        networkExecutor.execute {\n            try {\n                val json = fetchJson("https://api.tomtom.com/routing/1/calculateRoute/${location.latitude},${location.longitude}:${target.latitude},${target.longitude}/json?traffic=true&maxAlternatives=2&routeType=fastest&instructionsType=coded&key=${URLEncoder.encode(key, "UTF-8")}")\n                val routes = json.getJSONArray("routes")\n                val candidates = (0 until routes.length()).mapNotNull { try { parseTrafficRoute(routes.getJSONObject(it)) } catch (_: Exception) { null } }.filter {\n                    it.coordinates.filterIndexed { index, _ -> index % 10 == 0 }.any { p ->\n                        original.coordinates.none { old -> distanceMeters(p.latitude, p.longitude, old.latitude, old.longitude) < 100.0 }\n                    }\n                }.sortedBy { it.durationSeconds }\n                runOnUiThread {\n                    if (isFinishing || isDestroyed || offlineMode || currentRoute !== original || key != trafficApiKey || !visibleActivity) return@runOnUiThread\n                    if (candidates.isEmpty()) { trafficStatus.text = "Tiada laluan alternatif berbeza tersedia. Laluan asal dikekalkan."; return@runOnUiThread }\n                    AlertDialog.Builder(this).setTitle("Pilih laluan alternatif")\n                        .setItems(candidates.mapIndexed { i, r -> "Pilihan ${i + 1}: ${formatDistance(r.distanceMeters)} • ${formatDuration(r.durationSeconds)} (trafik)" }.toTypedArray()) { _, index ->\n                            tapFeedback()\n                            if (currentRoute !== original || offlineMode) return@setItems\n                            val r = candidates[index]\n                            routeRequestId += 1\n                            currentRoute = r\n                            currentStepIndex = r.steps.indexOfFirst { it.type != "depart" }.coerceAtLeast(0)\n                            warnedCameraIds.clear(); followGps = true\n                            currentStyle?.getSourceAs<GeoJsonSource>(ROUTE_SOURCE)?.setGeoJson(r.geoJson)\n                            updateTurnMarker(); updateMetrics(currentLocation)\n                            loadSpeedCameras(r.coordinates, r.distanceMeters)\n                            trafficLastCheck = 0L\n                            trafficStatus.text = "Laluan alternatif dipilih • © TomTom"\n                            tts?.speak(if (english) "Alternative route selected" else "Laluan alternatif dipilih", TextToSpeech.QUEUE_FLUSH, null, "alternative_selected")\n                        }.setNegativeButton("Kekalkan laluan asal", null).show()\n                }\n            } catch (_: Exception) {\n                runOnUiThread { if (!isFinishing && !isDestroyed && !offlineMode && currentRoute === original) trafficStatus.text = "Laluan alternatif tidak tersedia. Semak internet atau akses Routing API; laluan asal dikekalkan." }\n            }\n        }\n    }\n\n    private fun parseTrafficRoute(item: JSONObject): RouteResult {\n        val coordinates = mutableListOf<GeoPoint>()\n        val legs = item.getJSONArray("legs")\n        for (i in 0 until legs.length()) {\n            val points = legs.getJSONObject(i).getJSONArray("points")\n            for (j in 0 until points.length()) {\n                val p = points.getJSONObject(j); coordinates.add(GeoPoint(p.getDouble("latitude"), p.getDouble("longitude")))\n            }\n        }\n        require(coordinates.size > 1)\n        val summary = item.getJSONObject("summary")\n        val instructions = item.optJSONObject("guidance")?.optJSONArray("instructions") ?: JSONArray()\n        val steps = (0 until instructions.length()).map { index ->\n            val instruction = instructions.getJSONObject(index)\n            val point = instruction.getJSONObject("point")\n            val maneuver = instruction.optString("maneuver")\n            val type = when { maneuver == "DEPART" -> "depart"; maneuver.startsWith("ARRIVE") -> "arrive"; maneuver.contains("ROUNDABOUT") -> "roundabout"; maneuver.startsWith("KEEP_") -> "fork"; maneuver == "ENTER_MOTORWAY" -> "on ramp"; maneuver == "TAKE_EXIT" -> "off ramp"; maneuver.contains("LEFT") || maneuver.contains("RIGHT") || maneuver.contains("UTURN") -> "turn"; else -> "continue" }\n            val modifier = when { maneuver.contains("UTURN") -> "uturn"; maneuver == "BEAR_LEFT" -> "slight left"; maneuver == "BEAR_RIGHT" -> "slight right"; maneuver == "SHARP_LEFT" -> "sharp left"; maneuver == "SHARP_RIGHT" -> "sharp right"; maneuver.contains("LEFT") -> "left"; maneuver.contains("RIGHT") -> "right"; else -> "straight" }\n            val nextOffset = if (index + 1 < instructions.length()) instructions.getJSONObject(index + 1).optDouble("routeOffsetInMeters") else summary.getDouble("lengthInMeters")\n            RouteStep(point.getDouble("latitude"), point.getDouble("longitude"), describeManeuver(type, modifier, instruction.optString("street")),\n                (nextOffset - instruction.optDouble("routeOffsetInMeters")).coerceAtLeast(0.0), type)\n        }\n        require(steps.isNotEmpty()) { "No guidance" }\n        val geometry = JSONObject().put("type", "LineString").put("coordinates", JSONArray().apply { coordinates.forEach { put(JSONArray().put(it.longitude).put(it.latitude)) } })\n        val geoJson = JSONObject().put("type", "FeatureCollection").put("features", JSONArray().put(JSONObject().put("type", "Feature").put("geometry", geometry).put("properties", JSONObject()))).toString()\n        return RouteResult(geoJson, coordinates, summary.getDouble("lengthInMeters"), summary.getDouble("travelTimeInSeconds"), steps)\n    }\n' # Replaced with embedded literal in generated workflow.
+          offline = '    private var offlineBounds: org.maplibre.android.geometry.LatLngBounds? = null\n\n    private fun showMapModes() {\n        AlertDialog.Builder(this).setTitle("Peta Online / Offline")\n            .setItems(arrayOf("ONLINE — peta dan carian langsung", "MUAT TURUN — kawasan peta ini", "OFFLINE — pilih kawasan tersimpan", "HENTIKAN muat turun semasa")) { _, which ->\n                tapFeedback()\n                when (which) {\n                    0 -> {\n                        offlineMode = false; offlineBounds = null\n                        getPreferences(MODE_PRIVATE).edit().putBoolean("offline_mode", false).apply()\n                        MapLibre.setConnected(true)\n                        modeButton.text = "ONLINE"\n                        refreshOnlineMap()\n                        trafficStatus.text = if (trafficApiKey.isBlank()) "Trafik langsung: belum disambung" else "Trafik © TomTom: sedia"\n                    }\n                    1 -> if (offlineMode) Toast.makeText(this, "Pilih Online dahulu untuk muat turun.", Toast.LENGTH_LONG).show() else confirmOfflineDownload()\n                    2 -> chooseOfflineRegion()\n                    3 -> {\n                        activeDownload?.setDownloadState(org.maplibre.android.offline.OfflineRegion.STATE_INACTIVE)\n                        activeDownload?.setObserver(null); activeDownload = null\n                        statusText.text = "Muat turun dihentikan. Kawasan belum lengkap tidak boleh dipilih Offline."\n                    }\n                }\n            }.setNegativeButton("Tutup", null).show()\n    }\n\n    private fun confirmOfflineDownload() {\n        if (activeDownload != null) { Toast.makeText(this, "Satu muat turun sedang berjalan.", Toast.LENGTH_SHORT).show(); return }\n        val center = map?.cameraPosition?.target ?: return\n        AlertDialog.Builder(this).setTitle("Muat turun peta kawasan ini?")\n            .setMessage("Simpan kawasan sekitar 8 × 8 km pada zum 8–16 untuk paparan tanpa internet. Saiz bergantung pada kawasan. POI yang sudah dicari di sini turut disimpan. Carian destinasi baharu, laluan baharu dan trafik langsung memerlukan Online.")\n            .setPositiveButton("MUAT TURUN") { _, _ -> tapFeedback(); downloadOfflineArea(center) }\n            .setNegativeButton("Batal", null).show()\n    }\n\n    private fun downloadOfflineArea(center: LatLng) {\n        val deltaLat = 4000.0 / 111320.0\n        val deltaLon = deltaLat / kotlin.math.cos(Math.toRadians(center.latitude)).coerceAtLeast(0.1)\n        val bounds = org.maplibre.android.geometry.LatLngBounds.from(center.latitude + deltaLat, center.longitude + deltaLon,\n            center.latitude - deltaLat, center.longitude - deltaLon)\n        val definition = org.maplibre.android.offline.OfflineTilePyramidRegionDefinition(MAP_STYLE_URL, bounds, 8.0, 16.0, resources.displayMetrics.density)\n        val name = java.text.SimpleDateFormat("dd/MM HH:mm", Locale("ms", "MY")).format(java.util.Date()) + " (${String.format(Locale.US, "%.3f, %.3f", center.latitude, center.longitude)})"\n        val metadata = JSONObject().put("name", name).put("lat", center.latitude).put("lon", center.longitude).toString().toByteArray(Charsets.UTF_8)\n        val savedPoi = poiSearchCenter?.let { if (distanceMeters(it.latitude, it.longitude, center.latitude, center.longitude) < 300.0) poiPoints.toList() else emptyList() } ?: emptyList()\n        OfflineManager.getInstance(this).createOfflineRegion(definition, metadata, object : OfflineManager.CreateOfflineRegionCallback {\n            override fun onCreate(region: org.maplibre.android.offline.OfflineRegion) {\n                if (isFinishing || isDestroyed) return\n                activeDownload = region\n                val pois = JSONArray()\n                for (p in savedPoi) pois.put(JSONObject().put("id", p.id).put("name", p.name).put("category", p.category).put("religion", p.religion).put("lat", p.point.latitude).put("lon", p.point.longitude))\n                java.io.File(filesDir, "offline-poi-${region.id}.json").writeText(pois.toString())\n                region.setObserver(object : org.maplibre.android.offline.OfflineRegion.OfflineRegionObserver {\n                    override fun onStatusChanged(status: org.maplibre.android.offline.OfflineRegionStatus) {\n                        if (isFinishing || isDestroyed) return\n                        if (status.isComplete) {\n                            region.setDownloadState(org.maplibre.android.offline.OfflineRegion.STATE_INACTIVE)\n                            region.setObserver(null); activeDownload = null\n                            statusText.text = "Peta offline siap • ${savedPoi.size} POI tersimpan. Tekan ONLINE → OFFLINE untuk guna."\n                            tapFeedback()\n                        } else {\n                            val percent = if (status.requiredResourceCount > 0) (100.0 * status.completedResourceCount / status.requiredResourceCount).toInt().coerceIn(0, 99) else 0\n                            statusText.text = "Memuat turun peta: $percent% • ${status.completedResourceCount} sumber"\n                        }\n                    }\n                    override fun onError(error: org.maplibre.android.offline.OfflineRegionError) {\n                        if (isFinishing || isDestroyed) return\n                        region.setDownloadState(org.maplibre.android.offline.OfflineRegion.STATE_INACTIVE)\n                        region.setObserver(null); activeDownload = null\n                        statusText.text = "Muat turun belum lengkap: ${error.message}. Cuba semula dengan internet stabil."\n                    }\n                    override fun mapboxTileCountLimitExceeded(limit: Long) {\n                        region.setDownloadState(org.maplibre.android.offline.OfflineRegion.STATE_INACTIVE)\n                        region.setObserver(null); activeDownload = null\n                        if (!isFinishing && !isDestroyed) statusText.text = "Had jubin offline dicapai ($limit). Muat turun tidak lengkap."\n                    }\n                })\n                region.setDownloadState(org.maplibre.android.offline.OfflineRegion.STATE_ACTIVE)\n            }\n            override fun onError(error: String) { if (!isFinishing && !isDestroyed) statusText.text = "Tidak dapat menyediakan peta offline: $error" }\n        })\n    }\n\n    private fun chooseOfflineRegion() {\n        OfflineManager.getInstance(this).listOfflineRegions(object : OfflineManager.ListOfflineRegionsCallback {\n            override fun onList(regions: Array<org.maplibre.android.offline.OfflineRegion>?) {\n                if (isFinishing || isDestroyed) return\n                val saved = regions ?: emptyArray()\n                if (saved.isEmpty()) { statusText.text = "Belum ada peta tersimpan. Pilih Muat Turun semasa Online dahulu."; return }\n                val labels = saved.map { try { JSONObject(String(it.metadata, Charsets.UTF_8)).optString("name", "Kawasan ${it.id}") } catch (_: Exception) { "Kawasan ${it.id}" } }.toTypedArray()\n                AlertDialog.Builder(this@MainActivity).setTitle("Pilih kawasan offline")\n                    .setItems(labels) { _, index -> tapFeedback(); activateOfflineRegion(saved[index]) }.setNegativeButton("Tutup", null).show()\n            }\n            override fun onError(error: String) { if (!isFinishing && !isDestroyed) statusText.text = "Senarai offline gagal dibaca: $error" }\n        })\n    }\n\n    private fun activateOfflineRegion(region: org.maplibre.android.offline.OfflineRegion) {\n        region.getStatus(object : org.maplibre.android.offline.OfflineRegion.OfflineRegionStatusCallback {\n            override fun onStatus(status: org.maplibre.android.offline.OfflineRegionStatus?) {\n                if (status == null) return\n                if (isFinishing || isDestroyed) return\n                if (!status.isComplete) { statusText.text = "Muat turun kawasan ini belum lengkap. Pilih kawasan lain atau muat turun semula."; return }\n                val definition = region.definition as? org.maplibre.android.offline.OfflineTilePyramidRegionDefinition ?: return\n                val regionBounds = definition.bounds ?: return\n                offlineMode = true; offlineBounds = regionBounds\n                poiSearchCenter = GeoPoint(regionBounds.center.latitude, regionBounds.center.longitude)\n                getPreferences(MODE_PRIVATE).edit().putBoolean("offline_mode", true).putLong("offline_region", region.id).apply()\n                activeDownload?.setDownloadState(org.maplibre.android.offline.OfflineRegion.STATE_INACTIVE)\n                activeDownload?.setObserver(null); activeDownload = null\n                searchGeneration += 1; routeRequestId += 1; poiRequestId += 1; poiLoading = false; poiSearchButton.isEnabled = true\n                trafficDialog?.dismiss()\n                MapLibre.setConnected(false)\n                modeButton.text = "OFFLINE"\n                trafficStatus.text = "OFFLINE • Trafik langsung dan laluan baharu tidak tersedia"\n                val poiFile = java.io.File(filesDir, "offline-poi-${region.id}.json")\n                poiPoints = try {\n                    val json = JSONArray(if (poiFile.exists()) poiFile.readText() else "[]")\n                    (0 until json.length()).map { i -> val p = json.getJSONObject(i); Poi(p.getString("id"), p.getString("name"), p.getString("category"), GeoPoint(p.getDouble("lat"), p.getDouble("lon")), p.optString("religion")) }\n                } catch (_: Exception) { emptyList() }\n                refreshPoiLayer()\n                poiStatusText.text = "${poiPoints.size} POI tersimpan • Tidak dikemas kini semasa Offline"\n                followGps = false\n                map?.animateCamera(CameraUpdateFactory.newLatLngZoom(regionBounds.center, 13.5))\n                statusText.text = "Peta Offline aktif. Data hanya tersedia dalam kawasan dimuat turun, zum 8–16."\n            }\n            override fun onError(error: String?) { if (!isFinishing && !isDestroyed) statusText.text = "Peta offline tidak dapat disemak: $error" }\n        })\n    }\n'
+          patch('    private fun makeButton(label: String)', methods + '\n' + offline + '\n' + '''    private fun visiblePois(): List<Poi> {
+                  val category = if (::poiCategorySpinner.isInitialized) poiCategorySpinner.selectedItemPosition else 0
+                  return if (!offlineMode || category <= 0) poiPoints else poiPoints.filter { NavigationRules.matchesCategory(it.category, category) && (category != 4 || it.religion == "muslim") }
+              }
+          
+              private fun restoreOfflineSelection() {
+                  val wanted = getPreferences(MODE_PRIVATE).getLong("offline_region", -1L)
+                  OfflineManager.getInstance(this).listOfflineRegions(object : OfflineManager.ListOfflineRegionsCallback {
+                      override fun onList(regions: Array<org.maplibre.android.offline.OfflineRegion>?) {
+                          if (isFinishing || isDestroyed) return
+                          val region = regions?.firstOrNull { it.id == wanted }
+                          if (region != null) activateOfflineRegion(region)
+                          else statusText.text = "Kawasan offline tidak ditemui. Tekan OFFLINE untuk memilih mod Online."
+                      }
+                      override fun onError(error: String) { if (!isFinishing && !isDestroyed) statusText.text = "Peta offline gagal dibaca: $error" }
+                  })
+              }
+          
+              private fun makeButton(label: String)''')
+          path.write_text(source)
+          rules = Path('app/src/main/java/com/nav3dmalaysia/NavigationRules.kt')
+          rules.write_text(r'''package com.nav3dmalaysia
+          import java.util.Locale
+          object NavigationRules {
+              val poiKeys = listOf("amenity", "shop", "tourism", "leisure", "office", "craft", "healthcare", "historic", "emergency", "public_transport", "aeroway", "railway", "sport", "natural", "man_made")
+              fun allPoiQuery(lat: Double, lon: Double): String {
+                  val around = "(around:3000,$lat,$lon)"
+                  val keys = poiKeys.filter { it != "natural" && it != "man_made" }.joinToString("|")
+                  return "[out:json][timeout:25];(nwr$around[~\"^($keys)$\"~\".\"];nwr$around[\"natural\"][\"name\"];nwr$around[\"man_made\"][\"name\"];);out center tags;"
+              }
+              fun searchRank(name: String, address: String, query: String): Int {
+                  val q = query.trim().lowercase(Locale.ROOT)
+                  val n = name.lowercase(Locale.ROOT)
+                  return when { q.isEmpty() -> 3; n.startsWith(q) -> 0; n.contains(q) -> 1; address.lowercase(Locale.ROOT).contains(q) -> 2; else -> 3 }
+              }
+              fun isCongested(confidence: Double, current: Double, free: Double, delay: Double, closed: Boolean): Boolean =
+                  confidence >= 0.7 && (closed || (free > 0 && current >= 0 && current < free * 0.5 && delay >= 60))
+              fun matchesCategory(kind: String, category: Int): Boolean = when (category) {
+                  1 -> kind == "fuel"
+                  2 -> kind in setOf("restaurant", "cafe", "fast food", "food court")
+                  3 -> kind in setOf("hospital", "clinic", "pharmacy")
+                  4 -> kind == "place of worship"
+                  5 -> kind in setOf("atm", "bank")
+                  6 -> kind == "parking"
+                  7 -> kind in setOf("supermarket", "convenience", "mall")
+                  8 -> kind in setOf("attraction", "museum", "viewpoint")
+                  else -> true
+              }
+          }
+          ''')
+          tests = Path('app/src/test/java/com/nav3dmalaysia/NavigationRulesTest.kt')
+          tests.parent.mkdir(parents=True, exist_ok=True)
+          tests.write_text('''package com.nav3dmalaysia
+          import org.junit.Assert.*
+          import org.junit.Test
+          class NavigationRulesTest {
+              @Test fun prefixBeforeContainsBeforeAddress() {
+                  assertEquals(0, NavigationRules.searchRank("Kuala Lumpur", "Selangor", "KUALA"))
+                  assertEquals(1, NavigationRules.searchRank("Masjid Kuala", "", "kuala"))
+                  assertEquals(2, NavigationRules.searchRank("KLCC", "Kuala Lumpur", "kuala"))
+                  assertEquals(3, NavigationRules.searchRank("Ipoh", "Perak", "kuala"))
+              }
+              @Test fun allPoiIncludesMissingCategoriesAndNoResultCap() {
+                  val query = NavigationRules.allPoiQuery(3.0, 101.0)
+                  for (tag in listOf("amenity", "shop", "tourism", "leisure", "office", "healthcare", "public_transport", "natural", "historic", "craft")) assertTrue(query.contains(tag))
+                  assertTrue(query.contains("around:3000,3.0,101.0"))
+                  assertTrue(query.endsWith("out center tags;"))
+              }
+              @Test fun noJamFromGpsOrLowConfidenceOrNormalFlow() {
+                  assertFalse(NavigationRules.isCongested(0.2, 1.0, 60.0, 200.0, false))
+                  assertFalse(NavigationRules.isCongested(0.9, 55.0, 60.0, 100.0, false))
+                  assertFalse(NavigationRules.isCongested(0.9, 10.0, 60.0, 10.0, false))
+                  assertTrue(NavigationRules.isCongested(0.9, 10.0, 60.0, 120.0, false))
+                  assertTrue(NavigationRules.isCongested(0.9, 0.0, 60.0, 0.0, true))
+              }
+          }
+          ''')
+          gradle = Path('app/build.gradle.kts')
+          config = gradle.read_text().replace('versionCode = 3', 'versionCode = 4').replace('versionName = "1.1.1"', 'versionName = "2.0.0"')
+          config = config.replace('dependencies {', 'dependencies {\n    testImplementation("junit:junit:4.13.2")', 1)
+          gradle.write_text(config)
+          print('Advanced POIs, suggestions, feedback, traffic integration and offline map modes applied.')
+          PY
+
+      - name: Apply TomTom-style navigation display
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("app/src/main/java/com/nav3dmalaysia/MainActivity.kt")
+          source = path.read_text(encoding="utf-8")
+
+          # Give the navigation camera a forward-looking 3D perspective only while navigating.
+          camera_pattern = r'(\.zoom\(nextCameraZoom\(location\)\)\s*\n\s*\.bearing\(bearing\))'
+          match = re.search(camera_pattern, source)
+          if not match:
+              raise SystemExit("TomTom style patch: navigation camera builder not found")
+          bearing_line = re.search(r'\n(\s*)\.bearing\(bearing\)', match.group(1))
+          indent = bearing_line.group(1) if bearing_line else "                            "
+          source = source[:match.end()] + "\n" + indent + ".tilt(if (navigationStarted) 55.0 else 0.0)" + source[match.end():]
+
+          # Keep the next-turn instruction visible as a navigation banner.
+          hidden_turn = "nextTurnText.visibility = android.view.View.GONE"
+          if source.count(hidden_turn) != 1:
+              raise SystemExit("TomTom style patch: next-turn visibility anchor not found uniquely")
+          source = source.replace(hidden_turn, "nextTurnText.visibility = android.view.View.VISIBLE", 1)
+
+          # Upgrade the selected route to a stronger blue with a white casing.
+          if source.count('lineColor("#005BFF")') != 1:
+              raise SystemExit("TomTom style patch: selected route color anchor not found uniquely")
+          source = source.replace('lineColor("#005BFF")', 'lineColor("#1677FF")', 1)
+          source, casing_count = re.subn(r'(LineLayer\(ROUTE_CASING_LAYER, ROUTE_SOURCE\).*?lineWidth\()10f(\))', r'\g<1>12f\2', source, count=1, flags=re.S)
+          source, route_count = re.subn(r'(LineLayer\(ROUTE_LAYER, ROUTE_SOURCE\).*?lineWidth\()6f(\))', r'\g<1>8f\2', source, count=1, flags=re.S)
+          if casing_count != 1 or route_count != 1:
+              raise SystemExit("TomTom style patch: route line widths could not be updated")
+
+          # Use a compact dark navigation panel, with high-contrast turn, speed and traffic text.
+          panel_pattern = r'(?m)^(\s*)bottomPanel\.addView\(trafficStatus, LinearLayout\.LayoutParams\(-1, -2\)\)$'
+          panel_match = re.search(panel_pattern, source)
+          if not panel_match:
+              raise SystemExit("TomTom style patch: bottom navigation panel anchor not found")
+          indent = panel_match.group(1)
+          panel_style = "\n".join([
+              indent + 'bottomPanel.background = android.graphics.drawable.GradientDrawable().apply {',
+              indent + '    setColor(Color.rgb(15, 23, 42))',
+              indent + '    cornerRadius = dp(18).toFloat()',
+              indent + '}',
+              indent + 'bottomPanel.setPadding(dp(14), dp(10), dp(14), dp(10))',
+              indent + 'bottomPanel.elevation = dp(8).toFloat()',
+              indent + 'statusText.setTextColor(Color.rgb(203, 213, 225))',
+              indent + 'metricsText.setTextColor(Color.rgb(226, 232, 240))',
+              indent + 'metricsText.textSize = 14f',
+              indent + 'nextTurnText.visibility = android.view.View.VISIBLE',
+              indent + 'nextTurnText.setTextColor(Color.WHITE)',
+              indent + 'nextTurnText.textSize = 18f',
+              indent + 'nextTurnText.setTypeface(null, android.graphics.Typeface.BOLD)',
+              indent + 'trafficStatus.setTextColor(Color.rgb(148, 163, 184))',
+              indent + 'routeLegendText.visibility = android.view.View.GONE',
+          ])
+          insert_at = panel_match.end()
+          source = source[:insert_at] + "\n" + panel_style + source[insert_at:]
+
+          path.write_text(source, encoding="utf-8")
+          print("TomTom-style navigation display applied: 3D follow camera, stronger blue route, visible turn banner, dark HUD.")
+          PY
+
+      - name: Build APK
+        working-directory: buildsrc/QM-NAVIGASI-Android
+        run: gradle --no-daemon testDebugUnitTest assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: QM-NAVIGASI-V2-SMART-OFFLINE-APK
+          path: buildsrc/QM-NAVIGASI-Android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
