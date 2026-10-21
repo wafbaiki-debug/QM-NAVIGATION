@@ -1217,7 +1217,7 @@ jobs:
           path = Path("app/src/main/java/com/nav3dmalaysia/MainActivity.kt")
           source = path.read_text(encoding="utf-8")
           old = "https://tiles.openfreemap.org/styles/liberty"
-          new = "https://tiles.openfreemap.org/styles/dark"
+          new = "https://tiles.openfreemap.org/styles/liberty"
           count = source.count(old)
           if count != 1:
               raise SystemExit(f"Expected one base map style URL, found {count}")
